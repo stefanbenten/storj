@@ -8,6 +8,7 @@ import (
 	"encoding/gob"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // GetBytes transforms an empty interface type into a byte slice
@@ -37,7 +38,20 @@ func ParseURL(s string) (*url.URL, error) {
 }
 
 // CombineErrors combines multiple errors to a single error
-func CombineErrors(errs ...error) error { return combinedError(errs) }
+func CombineErrors(errs ...error) error {
+	var errlist combinedError
+	for _, err := range errs {
+		if err != nil {
+			errlist = append(errlist, err)
+		}
+	}
+	if len(errlist) == 0 {
+		return nil
+	} else if len(errlist) == 1 {
+		return errlist[0]
+	}
+	return errlist
+}
 
 type combinedError []error
 
@@ -61,4 +75,34 @@ func (errs combinedError) Error() string {
 		return allErrors
 	}
 	return ""
+}
+
+// CollectErrors returns first error from channel and all errors that happen within duration
+func CollectErrors(errch chan error, duration time.Duration) error {
+	errch = discardNil(errch)
+	errs := []error{<-errch}
+	timeout := time.After(duration)
+	for {
+		select {
+		case err := <-errch:
+			errs = append(errs, err)
+		case <-timeout:
+			return CombineErrors(errs...)
+		}
+	}
+}
+
+// discard nil errors that are returned from services
+func discardNil(ch chan error) chan error {
+	r := make(chan error)
+	go func() {
+		for err := range ch {
+			if err == nil {
+				continue
+			}
+			r <- err
+		}
+		close(r)
+	}()
+	return r
 }

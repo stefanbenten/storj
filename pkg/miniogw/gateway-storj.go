@@ -6,6 +6,7 @@ package miniogw
 import (
 	"context"
 	"io"
+	"strings"
 	"time"
 
 	minio "github.com/minio/minio/cmd"
@@ -14,11 +15,11 @@ import (
 	"github.com/zeebo/errs"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
-	"storj.io/storj/pkg/paths"
 	"storj.io/storj/pkg/ranger"
 	"storj.io/storj/pkg/storage/buckets"
 	"storj.io/storj/pkg/storage/meta"
 	"storj.io/storj/pkg/storage/objects"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage"
 )
@@ -31,12 +32,13 @@ var (
 
 // NewStorjGateway creates a *Storj object from an existing ObjectStore
 func NewStorjGateway(bs buckets.Store) *Storj {
-	return &Storj{bs: bs}
+	return &Storj{bs: bs, multipart: NewMultipartUploads()}
 }
 
 //Storj is the implementation of a minio cmd.Gateway
 type Storj struct {
-	bs buckets.Store
+	bs        buckets.Store
+	multipart *MultipartUploads
 }
 
 // Name implements cmd.Gateway
@@ -73,7 +75,7 @@ func (s *storjObjects) DeleteBucket(ctx context.Context, bucket string) (err err
 	if err != nil {
 		return err
 	}
-	items, _, err := o.List(ctx, nil, nil, nil, true, 1, meta.None)
+	items, _, err := o.List(ctx, "", "", "", true, 1, meta.None)
 	if err != nil {
 		return err
 	}
@@ -89,7 +91,11 @@ func (s *storjObjects) DeleteObject(ctx context.Context, bucket, object string) 
 	if err != nil {
 		return err
 	}
-	return o.Delete(ctx, paths.New(object))
+	err = o.Delete(ctx, object)
+	if storage.ErrKeyNotFound.Has(err) {
+		err = minio.ObjectNotFound{Bucket: bucket, Object: object}
+	}
+	return err
 }
 
 func (s *storjObjects) GetBucketInfo(ctx context.Context, bucket string) (
@@ -107,14 +113,14 @@ func (s *storjObjects) GetBucketInfo(ctx context.Context, bucket string) (
 	return minio.BucketInfo{Name: bucket, Created: meta.Created}, nil
 }
 
-func (s *storjObjects) getObject(ctx context.Context, bucket, object string) (rr ranger.RangeCloser, err error) {
+func (s *storjObjects) getObject(ctx context.Context, bucket, object string) (rr ranger.Ranger, err error) {
 	defer mon.Task()(&ctx)(&err)
 	o, err := s.storj.bs.GetObjectStore(ctx, bucket)
 	if err != nil {
 		return nil, err
 	}
 
-	rr, _, err = o.Get(ctx, paths.New(object))
+	rr, _, err = o.Get(ctx, object)
 
 	return rr, err
 }
@@ -128,7 +134,6 @@ func (s *storjObjects) GetObject(ctx context.Context, bucket, object string,
 		return err
 	}
 
-	defer utils.LogClose(rr)
 	if length == -1 {
 		length = rr.Size() - startOffset
 	}
@@ -151,7 +156,7 @@ func (s *storjObjects) GetObjectInfo(ctx context.Context, bucket,
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
-	m, err := o.Meta(ctx, paths.New(object))
+	m, err := o.Meta(ctx, object)
 	if err != nil {
 		if storage.ErrKeyNotFound.Has(err) {
 			return objInfo, minio.ObjectNotFound{
@@ -197,44 +202,125 @@ func (s *storjObjects) ListBuckets(ctx context.Context) (
 	return bucketItems, err
 }
 
-func (s *storjObjects) ListObjects(ctx context.Context, bucket, prefix, marker,
-	delimiter string, maxKeys int) (result minio.ListObjectsInfo, err error) {
+func (s *storjObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (result minio.ListObjectsInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
-	startAfter := paths.New(marker)
-	var fl []minio.ObjectInfo
+
+	if delimiter != "" && delimiter != "/" {
+		return minio.ListObjectsInfo{}, Error.New("delimiter %s not supported", delimiter)
+	}
+
+	startAfter := marker
+	recursive := delimiter == ""
+
+	var objects []minio.ObjectInfo
+	var prefixes []string
 	o, err := s.storj.bs.GetObjectStore(ctx, bucket)
 	if err != nil {
 		return minio.ListObjectsInfo{}, err
 	}
-	items, more, err := o.List(ctx, paths.New(prefix), startAfter, nil, true, maxKeys, meta.All)
+	items, more, err := o.List(ctx, prefix, startAfter, "", recursive, maxKeys, meta.All)
 	if err != nil {
 		return result, err
 	}
 	if len(items) > 0 {
-		//Populate the objectlist (aka filelist)
-		f := make([]minio.ObjectInfo, len(items))
-		for i, fi := range items {
-			f[i] = minio.ObjectInfo{
-				Bucket:      bucket,
-				IsDir:       fi.IsPrefix,
-				Name:        fi.Path.String(),
-				ModTime:     fi.Meta.Modified,
-				Size:        fi.Meta.Size,
-				ContentType: fi.Meta.ContentType,
-				UserDefined: fi.Meta.UserDefined,
-				ETag:        fi.Meta.Checksum,
+		for _, item := range items {
+			path := item.Path
+			if recursive && prefix != "" {
+				path = storj.JoinPaths(strings.TrimSuffix(prefix, "/"), path)
 			}
+			if item.IsPrefix {
+				prefixes = append(prefixes, path)
+				continue
+			}
+			objects = append(objects, minio.ObjectInfo{
+				Bucket:      bucket,
+				IsDir:       false,
+				Name:        path,
+				ModTime:     item.Meta.Modified,
+				Size:        item.Meta.Size,
+				ContentType: item.Meta.ContentType,
+				UserDefined: item.Meta.UserDefined,
+				ETag:        item.Meta.Checksum,
+			})
 		}
-		startAfter = items[len(items)-1].Path[len(paths.New(prefix)):]
-		fl = f
+		startAfter = items[len(items)-1].Path
 	}
 
 	result = minio.ListObjectsInfo{
 		IsTruncated: more,
-		Objects:     fl,
+		Objects:     objects,
+		Prefixes:    prefixes,
 	}
 	if more {
-		result.NextMarker = startAfter.String()
+		result.NextMarker = startAfter
+	}
+
+	return result, err
+}
+
+// ListObjectsV2 - Not implemented stub
+func (s *storjObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result minio.ListObjectsV2Info, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	if delimiter != "" && delimiter != "/" {
+		return minio.ListObjectsV2Info{ContinuationToken: continuationToken}, Error.New("delimiter %s not supported", delimiter)
+	}
+
+	recursive := delimiter == ""
+	var nextContinuationToken string
+
+	var startAfterPath storj.Path
+	if continuationToken != "" {
+		startAfterPath = continuationToken
+	}
+	if startAfterPath == "" && startAfter != "" {
+		startAfterPath = startAfter
+	}
+
+	var objects []minio.ObjectInfo
+	var prefixes []string
+	o, err := s.storj.bs.GetObjectStore(ctx, bucket)
+	if err != nil {
+		return minio.ListObjectsV2Info{ContinuationToken: continuationToken}, err
+	}
+	items, more, err := o.List(ctx, prefix, startAfterPath, "", recursive, maxKeys, meta.All)
+	if err != nil {
+		return result, err
+	}
+
+	if len(items) > 0 {
+		for _, item := range items {
+			path := item.Path
+			if recursive && prefix != "" {
+				path = storj.JoinPaths(strings.TrimSuffix(prefix, "/"), path)
+			}
+			if item.IsPrefix {
+				prefixes = append(prefixes, path)
+				continue
+			}
+			objects = append(objects, minio.ObjectInfo{
+				Bucket:      bucket,
+				IsDir:       false,
+				Name:        path,
+				ModTime:     item.Meta.Modified,
+				Size:        item.Meta.Size,
+				ContentType: item.Meta.ContentType,
+				UserDefined: item.Meta.UserDefined,
+				ETag:        item.Meta.Checksum,
+			})
+		}
+
+		nextContinuationToken = items[len(items)-1].Path + "\x00"
+	}
+
+	result = minio.ListObjectsV2Info{
+		IsTruncated:       more,
+		ContinuationToken: continuationToken,
+		Objects:           objects,
+		Prefixes:          prefixes,
+	}
+	if more {
+		result.NextContinuationToken = nextContinuationToken
 	}
 
 	return result, err
@@ -270,8 +356,6 @@ func (s *storjObjects) CopyObject(ctx context.Context, srcBucket, srcObject, des
 		return objInfo, err
 	}
 
-	defer utils.LogClose(rr)
-
 	r, err := rr.Range(ctx, 0, rr.Size())
 	if err != nil {
 		return objInfo, err
@@ -297,7 +381,7 @@ func (s *storjObjects) putObject(ctx context.Context, bucket, object string, r i
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
-	m, err := o.Put(ctx, paths.New(object), r, meta, expTime)
+	m, err := o.Put(ctx, object, r, meta, expTime)
 	return minio.ObjectInfo{
 		Name:        object,
 		Bucket:      bucket,
@@ -312,6 +396,7 @@ func (s *storjObjects) putObject(ctx context.Context, bucket, object string, r i
 func (s *storjObjects) PutObject(ctx context.Context, bucket, object string,
 	data *hash.Reader, metadata map[string]string) (objInfo minio.ObjectInfo,
 	err error) {
+
 	defer mon.Task()(&ctx)(&err)
 	tempContType := metadata["content-type"]
 	delete(metadata, "content-type")

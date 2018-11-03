@@ -14,11 +14,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	p "storj.io/storj/pkg/paths"
-	client "storj.io/storj/pkg/pointerdb/pdbclient"
+	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/pointerdb/pdbclient"
 	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/storage/meta"
-	proto "storj.io/storj/protos/pointerdb"
 )
 
 var (
@@ -35,9 +34,9 @@ func main() {
 	initializeFlags()
 
 	logger, _ := zap.NewDevelopment()
-	defer logger.Sync()
+	defer printError(logger.Sync)
 
-	ca, err := provider.NewCA(ctx, 12, 4)
+	ca, err := provider.NewTestCA(ctx)
 	if err != nil {
 		logger.Error("Failed to create certificate authority: ", zap.Error(err))
 		os.Exit(1)
@@ -47,8 +46,8 @@ func main() {
 		logger.Error("Failed to create full identity: ", zap.Error(err))
 		os.Exit(1)
 	}
-	APIKey := []byte("abc123")
-	pdbclient, err := client.NewClient(identity, pointerdbClientPort, APIKey)
+	APIKey := "abc123"
+	client, err := pdbclient.NewClient(identity, pointerdbClientPort, APIKey)
 
 	if err != nil {
 		logger.Error("Failed to dial: ", zap.Error(err))
@@ -59,14 +58,14 @@ func main() {
 	ctx := context.Background()
 
 	// Example parameters to pass into API calls
-	var path = p.New("fold1/fold2/fold3/file.txt")
-	pointer := &proto.Pointer{
-		Type:          proto.Pointer_INLINE,
+	var path = "fold1/fold2/fold3/file.txt"
+	pointer := &pb.Pointer{
+		Type:          pb.Pointer_INLINE,
 		InlineSegment: []byte("popcorn"),
 	}
 
 	// Example Put1
-	err = pdbclient.Put(ctx, path, pointer)
+	err = client.Put(ctx, path, pointer)
 
 	if err != nil || status.Code(err) == codes.Internal {
 		logger.Error("couldn't put pointer in db", zap.Error(err))
@@ -75,7 +74,7 @@ func main() {
 	}
 
 	// Example Put2
-	err = pdbclient.Put(ctx, p.New("fold1/fold2"), pointer)
+	err = client.Put(ctx, "fold1/fold2", pointer)
 
 	if err != nil || status.Code(err) == codes.Internal {
 		logger.Error("couldn't put pointer in db", zap.Error(err))
@@ -84,7 +83,7 @@ func main() {
 	}
 
 	// Example Get
-	getRes, err := pdbclient.Get(ctx, path)
+	getRes, err := client.Get(ctx, path)
 
 	if err != nil {
 		logger.Error("couldn't GET pointer from db", zap.Error(err))
@@ -95,25 +94,31 @@ func main() {
 	}
 
 	// Example List with pagination
-	prefix := p.New("fold1")
-	items, more, err := pdbclient.List(ctx, prefix, nil, nil, true, 1, meta.None)
+	items, more, err := client.List(ctx, "fold1", "", "", true, 1, meta.None)
 
 	if err != nil || status.Code(err) == codes.Internal {
 		logger.Error("failed to list file paths", zap.Error(err))
 	} else {
 		var stringList []string
 		for _, item := range items {
-			stringList = append(stringList, item.Path.String())
+			stringList = append(stringList, item.Path)
 		}
 		logger.Debug("Success: listed paths: " + strings.Join(stringList, ", ") + "; more: " + fmt.Sprintf("%t", more))
 	}
 
 	// Example Delete
-	err = pdbclient.Delete(ctx, path)
+	err = client.Delete(ctx, path)
 
 	if err != nil || status.Code(err) == codes.Internal {
 		logger.Error("Error in deleteing file from db", zap.Error(err))
 	} else {
 		logger.Debug("Success: file is deleted from db")
+	}
+}
+
+func printError(fn func() error) {
+	err := fn()
+	if err != nil {
+		fmt.Println(err)
 	}
 }

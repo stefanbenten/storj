@@ -19,15 +19,17 @@ import (
 	"github.com/vivint/infectious"
 
 	"storj.io/storj/pkg/eestream"
+	"storj.io/storj/pkg/encryption"
 	"storj.io/storj/pkg/ranger"
+	"storj.io/storj/pkg/storj"
 )
 
 var (
-	addr           = flag.String("addr", "localhost:8080", "address to serve from")
-	pieceBlockSize = flag.Int("piece_block_size", 4*1024, "block size of pieces")
-	key            = flag.String("key", "a key", "the secret key")
-	rsk            = flag.Int("required", 20, "rs required")
-	rsn            = flag.Int("total", 40, "rs total")
+	addr             = flag.String("addr", "localhost:8080", "address to serve from")
+	erasureShareSize = flag.Int("erasure_share_size", 4*1024, "block size of pieces")
+	key              = flag.String("key", "a key", "the secret key")
+	rsk              = flag.Int("required", 20, "rs required")
+	rsn              = flag.Int("total", 40, "rs total")
 )
 
 func main() {
@@ -45,15 +47,14 @@ func main() {
 
 // Main is the exported CLI executable function
 func Main() error {
-	encKey := sha256.Sum256([]byte(*key))
+	encKey := storj.Key(sha256.Sum256([]byte(*key)))
 	fc, err := infectious.NewFEC(*rsk, *rsn)
 	if err != nil {
 		return err
 	}
-	es := eestream.NewRSScheme(fc, *pieceBlockSize)
-	var firstNonce [12]byte
-	decrypter, err := eestream.NewAESGCMDecrypter(
-		&encKey, &firstNonce, es.DecodedBlockSize())
+	es := eestream.NewRSScheme(fc, *erasureShareSize)
+	var firstNonce storj.Nonce
+	decrypter, err := encryption.NewDecrypter(storj.AESGCM, &encKey, &firstNonce, es.StripeSize())
 	if err != nil {
 		return err
 	}
@@ -61,7 +62,7 @@ func Main() error {
 	if err != nil {
 		return err
 	}
-	rrs := map[int]ranger.RangeCloser{}
+	rrs := map[int]ranger.Ranger{}
 	for _, piece := range pieces {
 		piecenum, err := strconv.Atoi(strings.TrimSuffix(piece.Name(), ".piece"))
 		if err != nil {
@@ -77,8 +78,7 @@ func Main() error {
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
-	rr, err := eestream.Transform(rc, decrypter)
+	rr, err := encryption.Transform(rc, decrypter)
 	if err != nil {
 		return err
 	}

@@ -5,8 +5,9 @@ package server
 
 import (
 	"github.com/gogo/protobuf/proto"
+
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/utils"
-	pb "storj.io/storj/protos/piecestore"
 )
 
 // StreamWriter -- Struct for writing piece to server upload stream
@@ -54,18 +55,18 @@ func NewStreamReader(s *Server, stream pb.PieceStoreRoutes_StoreServer) *StreamR
 			if err = s.verifySignature(stream.Context(), ba); err != nil {
 				return nil, err
 			}
-		}
 
-		deserializedData := &pb.RenterBandwidthAllocation_Data{}
-		err = proto.Unmarshal(ba.GetData(), deserializedData)
-		if err != nil {
-			return nil, err
-		}
+			deserializedData := &pb.RenterBandwidthAllocation_Data{}
+			err = proto.Unmarshal(ba.GetData(), deserializedData)
+			if err != nil {
+				return nil, err
+			}
 
-		// Update bandwidthallocation to be stored
-		if deserializedData.GetTotal() > sr.currentTotal {
-			sr.bandwidthAllocation = ba
-			sr.currentTotal = deserializedData.GetTotal()
+			// Update bandwidthallocation to be stored
+			if deserializedData.GetTotal() > sr.currentTotal {
+				sr.bandwidthAllocation = ba
+				sr.currentTotal = deserializedData.GetTotal()
+			}
 		}
 
 		return pd.GetContent(), nil

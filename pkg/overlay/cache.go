@@ -13,11 +13,12 @@ import (
 	"go.uber.org/zap"
 
 	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/kademlia"
-	"storj.io/storj/protos/overlay"
+	"storj.io/storj/pkg/node"
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/boltdb"
 	"storj.io/storj/storage/redis"
+	"storj.io/storj/storage/storelogger"
 )
 
 const (
@@ -38,33 +39,34 @@ type Cache struct {
 }
 
 // NewRedisOverlayCache returns a pointer to a new Cache instance with an initialized connection to Redis.
-func NewRedisOverlayCache(address, password string, db int, DHT dht.DHT) (*Cache, error) {
-	rc, err := redis.NewClient(address, password, db)
+func NewRedisOverlayCache(address, password string, dbindex int, dht dht.DHT) (*Cache, error) {
+	db, err := redis.NewClient(address, password, dbindex)
 	if err != nil {
 		return nil, err
 	}
-
-	return &Cache{
-		DB:  rc,
-		DHT: DHT,
-	}, nil
+	return NewOverlayCache(storelogger.New(zap.L(), db), dht), nil
 }
 
 // NewBoltOverlayCache returns a pointer to a new Cache instance with an initialized connection to a Bolt db.
-func NewBoltOverlayCache(dbPath string, DHT dht.DHT) (*Cache, error) {
-	bc, err := boltdb.NewClient(zap.L(), dbPath, OverlayBucket)
+func NewBoltOverlayCache(dbPath string, dht dht.DHT) (*Cache, error) {
+	db, err := boltdb.New(dbPath, OverlayBucket)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Cache{
-		DB:  bc,
-		DHT: DHT,
-	}, nil
+	return NewOverlayCache(storelogger.New(zap.L(), db), dht), nil
 }
 
-// Get looks up the provided nodeID from the redis cache
-func (o *Cache) Get(ctx context.Context, key string) (*overlay.Node, error) {
+// NewOverlayCache returns a new Cache
+func NewOverlayCache(db storage.KeyValueStore, dht dht.DHT) *Cache {
+	return &Cache{
+		DB:  db,
+		DHT: dht,
+	}
+}
+
+// Get looks up the provided nodeID from the overlay cache
+func (o *Cache) Get(ctx context.Context, key string) (*pb.Node, error) {
 	b, err := o.DB.Get([]byte(key))
 	if err != nil {
 		return nil, err
@@ -74,7 +76,7 @@ func (o *Cache) Get(ctx context.Context, key string) (*overlay.Node, error) {
 		return nil, nil
 	}
 
-	na := &overlay.Node{}
+	na := &pb.Node{}
 	if err := proto.Unmarshal(b, na); err != nil {
 		return nil, err
 	}
@@ -82,14 +84,43 @@ func (o *Cache) Get(ctx context.Context, key string) (*overlay.Node, error) {
 	return na, nil
 }
 
+// GetAll looks up the provided nodeIDs from the overlay cache
+func (o *Cache) GetAll(ctx context.Context, keys []string) ([]*pb.Node, error) {
+	if len(keys) == 0 {
+		return nil, OverlayError.New("no keys provided")
+	}
+	var ks storage.Keys
+	for _, v := range keys {
+		ks = append(ks, storage.Key(v))
+	}
+	vs, err := o.DB.GetAll(ks)
+	if err != nil {
+		return nil, err
+	}
+	var ns []*pb.Node
+	for _, v := range vs {
+		if v == nil {
+			ns = append(ns, nil)
+			continue
+		}
+		na := &pb.Node{}
+		err := proto.Unmarshal(v, na)
+		if err != nil {
+			return nil, OverlayError.New("could not unmarshal non-nil node: %v", err)
+		}
+		ns = append(ns, na)
+	}
+	return ns, nil
+}
+
 // Put adds a nodeID to the redis cache with a binary representation of proto defined Node
-func (o *Cache) Put(nodeID string, value overlay.Node) error {
+func (o *Cache) Put(nodeID string, value pb.Node) error {
 	data, err := proto.Marshal(&value)
 	if err != nil {
 		return err
 	}
 
-	return o.DB.Put(kademlia.StringToNodeID(nodeID).Bytes(), data)
+	return o.DB.Put(node.IDFromString(nodeID).Bytes(), data)
 }
 
 // Bootstrap walks the initialized network and populates the cache
@@ -100,17 +131,17 @@ func (o *Cache) Bootstrap(ctx context.Context) error {
 	}
 
 	for _, v := range nodes {
-		found, err := o.DHT.FindNode(ctx, kademlia.StringToNodeID(v.Id))
+		found, err := o.DHT.FindNode(ctx, node.IDFromString(v.Id))
 		if err != nil {
 			zap.Error(ErrNodeNotFound)
 		}
 
-		node, err := proto.Marshal(&found)
+		n, err := proto.Marshal(&found)
 		if err != nil {
 			return err
 		}
 
-		if err := o.DB.Put(kademlia.StringToNodeID(found.Id).Bytes(), node); err != nil {
+		if err := o.DB.Put(node.IDFromString(found.Id).Bytes(), n); err != nil {
 			return err
 		}
 	}
@@ -128,7 +159,7 @@ func (o *Cache) Refresh(ctx context.Context) error {
 		return err
 	}
 
-	rid := kademlia.NodeID(r)
+	rid := node.ID(r)
 	near, err := o.DHT.GetNodes(ctx, rid.String(), 128)
 	if err != nil {
 		return err

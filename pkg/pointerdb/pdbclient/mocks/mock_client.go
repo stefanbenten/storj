@@ -6,12 +6,10 @@ package mock_pointerdb
 
 import (
 	context "context"
-	reflect "reflect"
-
 	gomock "github.com/golang/mock/gomock"
-	paths "storj.io/storj/pkg/paths"
-	"storj.io/storj/pkg/pointerdb/pdbclient"
-	"storj.io/storj/protos/pointerdb"
+	reflect "reflect"
+	pb "storj.io/storj/pkg/pb"
+	pdbclient "storj.io/storj/pkg/pointerdb/pdbclient"
 )
 
 // MockClient is a mock of Client interface
@@ -38,7 +36,7 @@ func (m *MockClient) EXPECT() *MockClientMockRecorder {
 }
 
 // Delete mocks base method
-func (m *MockClient) Delete(arg0 context.Context, arg1 paths.Path) error {
+func (m *MockClient) Delete(arg0 context.Context, arg1 string) error {
 	ret := m.ctrl.Call(m, "Delete", arg0, arg1)
 	ret0, _ := ret[0].(error)
 	return ret0
@@ -50,9 +48,9 @@ func (mr *MockClientMockRecorder) Delete(arg0, arg1 interface{}) *gomock.Call {
 }
 
 // Get mocks base method
-func (m *MockClient) Get(arg0 context.Context, arg1 paths.Path) (*pointerdb.Pointer, error) {
+func (m *MockClient) Get(arg0 context.Context, arg1 string) (*pb.Pointer, error) {
 	ret := m.ctrl.Call(m, "Get", arg0, arg1)
-	ret0, _ := ret[0].(*pointerdb.Pointer)
+	ret0, _ := ret[0].(*pb.Pointer)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -63,7 +61,7 @@ func (mr *MockClientMockRecorder) Get(arg0, arg1 interface{}) *gomock.Call {
 }
 
 // List mocks base method
-func (m *MockClient) List(arg0 context.Context, arg1, arg2, arg3 paths.Path, arg4 bool, arg5 int, arg6 uint32) ([]pdbclient.ListItem, bool, error) {
+func (m *MockClient) List(arg0 context.Context, arg1, arg2, arg3 string, arg4 bool, arg5 int, arg6 uint32) ([]pdbclient.ListItem, bool, error) {
 	ret := m.ctrl.Call(m, "List", arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 	ret0, _ := ret[0].([]pdbclient.ListItem)
 	ret1, _ := ret[1].(bool)
@@ -76,8 +74,20 @@ func (mr *MockClientMockRecorder) List(arg0, arg1, arg2, arg3, arg4, arg5, arg6 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "List", reflect.TypeOf((*MockClient)(nil).List), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
+// PayerBandwidthAllocation mocks base method
+func (m *MockClient) PayerBandwidthAllocation() *pb.PayerBandwidthAllocation {
+	ret := m.ctrl.Call(m, "PayerBandwidthAllocation")
+	ret0, _ := ret[0].(*pb.PayerBandwidthAllocation)
+	return ret0
+}
+
+// PayerBandwidthAllocation indicates an expected call of PayerBandwidthAllocation
+func (mr *MockClientMockRecorder) PayerBandwidthAllocation() *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PayerBandwidthAllocation", reflect.TypeOf((*MockClient)(nil).PayerBandwidthAllocation))
+}
+
 // Put mocks base method
-func (m *MockClient) Put(arg0 context.Context, arg1 paths.Path, arg2 *pointerdb.Pointer) error {
+func (m *MockClient) Put(arg0 context.Context, arg1 string, arg2 *pb.Pointer) error {
 	ret := m.ctrl.Call(m, "Put", arg0, arg1, arg2)
 	ret0, _ := ret[0].(error)
 	return ret0
@@ -86,4 +96,17 @@ func (m *MockClient) Put(arg0 context.Context, arg1 paths.Path, arg2 *pointerdb.
 // Put indicates an expected call of Put
 func (mr *MockClientMockRecorder) Put(arg0, arg1, arg2 interface{}) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Put", reflect.TypeOf((*MockClient)(nil).Put), arg0, arg1, arg2)
+}
+
+// SignedMessage mocks base method
+func (m *MockClient) SignedMessage() (*pb.SignedMessage, error) {
+	ret := m.ctrl.Call(m, "SignedMessage")
+	ret0, _ := ret[0].(*pb.SignedMessage)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SignedMessage indicates an expected call of SignedMessage
+func (mr *MockClientMockRecorder) SignedMessage() *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SignedMessage", reflect.TypeOf((*MockClient)(nil).SignedMessage))
 }

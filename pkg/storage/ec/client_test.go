@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"testing"
 	"time"
 
@@ -19,10 +20,10 @@ import (
 	"github.com/vivint/infectious"
 
 	"storj.io/storj/pkg/eestream"
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/piecestore/rpc/client"
 	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/ranger"
-	proto "storj.io/storj/protos/overlay"
 )
 
 const (
@@ -36,17 +37,17 @@ var (
 )
 
 var (
-	node0 = &proto.Node{Id: "node-0"}
-	node1 = &proto.Node{Id: "node-1"}
-	node2 = &proto.Node{Id: "node-2"}
-	node3 = &proto.Node{Id: "node-3"}
+	node0 = &pb.Node{Id: "node-0"}
+	node1 = &pb.Node{Id: "node-1"}
+	node2 = &pb.Node{Id: "node-2"}
+	node3 = &pb.Node{Id: "node-3"}
 )
 
 type mockDialer struct {
-	m map[*proto.Node]client.PSClient
+	m map[*pb.Node]client.PSClient
 }
 
-func (d *mockDialer) dial(ctx context.Context, node *proto.Node) (
+func (d *mockDialer) dial(ctx context.Context, node *pb.Node) (
 	ps client.PSClient, err error) {
 	ps = d.m[node]
 	if ps == nil {
@@ -59,12 +60,12 @@ func TestNewECClient(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	tc := NewMockClient(ctrl)
+	transport := NewMockClient(ctrl)
 	mbm := 1234
 
 	privKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	identity := &provider.FullIdentity{Key: privKey}
-	ec := NewClient(identity, tc, mbm)
+	ec := NewClient(identity, transport, mbm)
 	assert.NotNil(t, ec)
 
 	ecc, ok := ec.(*ecClient)
@@ -74,8 +75,8 @@ func TestNewECClient(t *testing.T) {
 
 	dd, ok := ecc.d.(*defaultDialer)
 	assert.True(t, ok)
-	assert.NotNil(t, dd.t)
-	assert.Equal(t, dd.t, tc)
+	assert.NotNil(t, dd.transport)
+	assert.Equal(t, dd.transport, transport)
 }
 
 func TestDefaultDialer(t *testing.T) {
@@ -95,10 +96,10 @@ func TestDefaultDialer(t *testing.T) {
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
 
-		tc := NewMockClient(ctrl)
-		tc.EXPECT().DialNode(gomock.Any(), node0).Return(nil, tt.err)
+		transport := NewMockClient(ctrl)
+		transport.EXPECT().DialNode(gomock.Any(), node0).Return(nil, tt.err)
 
-		dd := defaultDialer{t: tc, identity: identity}
+		dd := defaultDialer{transport: transport, identity: identity}
 		_, err := dd.dial(ctx, node0)
 
 		if tt.errString != "" {
@@ -125,59 +126,67 @@ func TestPut(t *testing.T) {
 
 TestLoop:
 	for i, tt := range []struct {
-		nodes     []*proto.Node
+		nodes     []*pb.Node
 		min       int
 		mbm       int
 		badInput  bool
 		errs      []error
 		errString string
 	}{
-		{[]*proto.Node{}, 0, 0, true, []error{},
-			fmt.Sprintf("ecclient error: number of nodes (0) do not match total count (%d) of erasure scheme", n)},
-		{[]*proto.Node{node0, node1, node2, node3}, 0, -1, true,
+		{[]*pb.Node{}, 0, 0, true, []error{},
+			fmt.Sprintf("ecclient error: number of nodes (0) do not match total count (%v) of erasure scheme", n)},
+		{[]*pb.Node{node0, node1, node2, node3}, 0, -1, true,
 			[]error{nil, nil, nil, nil},
 			"eestream error: negative max buffer memory"},
-		{[]*proto.Node{node0, node1, node0, node3}, 0, 0, true,
+		{[]*pb.Node{node0, node1, node0, node3}, 0, 0, true,
 			[]error{nil, nil, nil, nil},
 			"ecclient error: duplicated nodes are not allowed"},
-		{[]*proto.Node{node0, node1, node2, node3}, 0, 0, false,
+		{[]*pb.Node{node0, node1, node2, node3}, 0, 0, false,
 			[]error{nil, nil, nil, nil}, ""},
-		{[]*proto.Node{node0, node1, node2, node3}, 0, 0, false,
+		{[]*pb.Node{node0, node1, node2, node3}, 0, 0, false,
 			[]error{nil, ErrDialFailed, nil, nil},
-			"ecclient error: successful puts (3) less than minimum threshold (4)"},
-		{[]*proto.Node{node0, node1, node2, node3}, 0, 0, false,
+			"ecclient error: successful puts (3) less than repair threshold (4)"},
+		{[]*pb.Node{node0, node1, node2, node3}, 0, 0, false,
 			[]error{nil, ErrOpFailed, nil, nil},
-			"ecclient error: successful puts (3) less than minimum threshold (4)"},
-		{[]*proto.Node{node0, node1, node2, node3}, 2, 0, false,
+			"ecclient error: successful puts (3) less than repair threshold (4)"},
+		{[]*pb.Node{node0, node1, node2, node3}, 2, 0, false,
 			[]error{nil, ErrDialFailed, nil, nil}, ""},
-		{[]*proto.Node{node0, node1, node2, node3}, 2, 0, false,
+		{[]*pb.Node{node0, node1, node2, node3}, 2, 0, false,
 			[]error{ErrOpFailed, ErrDialFailed, nil, ErrDialFailed},
-			"ecclient error: successful puts (1) less than minimum threshold (2)"},
+			"ecclient error: successful puts (1) less than repair threshold (2)"},
+		{[]*pb.Node{nil, nil, node2, node3}, 0, 0, false,
+			[]error{nil, nil, nil, nil}, ""},
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
 
 		id := client.NewPieceID()
 		ttl := time.Now()
 
-		errs := make(map[*proto.Node]error, len(tt.nodes))
+		errs := make(map[*pb.Node]error, len(tt.nodes))
 		for i, n := range tt.nodes {
 			errs[n] = tt.errs[i]
 		}
 
-		m := make(map[*proto.Node]client.PSClient, len(tt.nodes))
+		m := make(map[*pb.Node]client.PSClient, len(tt.nodes))
 		for _, n := range tt.nodes {
-			if !tt.badInput {
-				derivedID, err := id.Derive([]byte(n.GetId()))
-				if !assert.NoError(t, err, errTag) {
-					continue TestLoop
-				}
-				ps := NewMockPSClient(ctrl)
-				gomock.InOrder(
-					ps.EXPECT().Put(gomock.Any(), derivedID, gomock.Any(), ttl, gomock.Any()).Return(errs[n]),
-					ps.EXPECT().Close().Return(nil),
-				)
-				m[n] = ps
+			if n == nil || tt.badInput {
+				continue
 			}
+			derivedID, err := id.Derive([]byte(n.GetId()))
+			if !assert.NoError(t, err, errTag) {
+				continue TestLoop
+			}
+			ps := NewMockPSClient(ctrl)
+			gomock.InOrder(
+				ps.EXPECT().Put(gomock.Any(), derivedID, gomock.Any(), ttl, gomock.Any(), gomock.Any()).Return(errs[n]).
+					Do(func(ctx context.Context, id client.PieceID, data io.Reader, ttl time.Time, ba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) {
+						// simulate that the mocked piece store client is reading the data
+						_, err := io.Copy(ioutil.Discard, data)
+						assert.NoError(t, err, errTag)
+					}),
+				ps.EXPECT().Close().Return(nil),
+			)
+			m[n] = ps
 		}
 		rs, err := eestream.NewRedundancyStrategy(es, tt.min, 0)
 		if !assert.NoError(t, err, errTag) {
@@ -185,12 +194,21 @@ TestLoop:
 		}
 		r := io.LimitReader(rand.Reader, int64(size))
 		ec := ecClient{d: &mockDialer{m: m}, mbm: tt.mbm}
-		err = ec.Put(ctx, tt.nodes, rs, id, r, ttl)
+
+		successfulNodes, err := ec.Put(ctx, tt.nodes, rs, id, r, ttl, nil, nil)
 
 		if tt.errString != "" {
 			assert.EqualError(t, err, tt.errString, errTag)
 		} else {
 			assert.NoError(t, err, errTag)
+			assert.Equal(t, len(tt.nodes), len(successfulNodes), errTag)
+			for i := range tt.nodes {
+				if tt.errs[i] != nil {
+					assert.Nil(t, successfulNodes[i], errTag)
+				} else {
+					assert.Equal(t, tt.nodes[i], successfulNodes[i], errTag)
+				}
+			}
 		}
 	}
 }
@@ -211,54 +229,56 @@ func TestGet(t *testing.T) {
 
 TestLoop:
 	for i, tt := range []struct {
-		nodes     []*proto.Node
+		nodes     []*pb.Node
 		mbm       int
 		errs      []error
 		errString string
 	}{
-		{[]*proto.Node{}, 0, []error{}, "ecclient error: " +
-			"number of nodes do not match total count of erasure scheme"},
-		{[]*proto.Node{node0, node1, node2, node3}, -1,
+		{[]*pb.Node{}, 0, []error{}, "ecclient error: " +
+			fmt.Sprintf("number of nodes (0) do not match minimum required count (%v) of erasure scheme", k)},
+		{[]*pb.Node{node0, node1, node2, node3}, -1,
 			[]error{nil, nil, nil, nil},
 			"eestream error: negative max buffer memory"},
-		{[]*proto.Node{node0, node1, node2, node3}, 0,
+		{[]*pb.Node{node0, node1, node2, node3}, 0,
 			[]error{nil, nil, nil, nil}, ""},
-		{[]*proto.Node{node0, node1, node2, node3}, 0,
+		{[]*pb.Node{node0, node1, node2, node3}, 0,
 			[]error{nil, ErrDialFailed, nil, nil}, ""},
-		{[]*proto.Node{node0, node1, node2, node3}, 0,
+		{[]*pb.Node{node0, node1, node2, node3}, 0,
 			[]error{nil, ErrOpFailed, nil, nil}, ""},
-		{[]*proto.Node{node0, node1, node2, node3}, 0,
-			[]error{ErrOpFailed, ErrDialFailed, nil, ErrDialFailed},
-			"eestream error: not enough readers to reconstruct data!"},
-		{[]*proto.Node{node0, node1, node2, node3}, 0,
-			[]error{ErrDialFailed, ErrOpFailed, ErrOpFailed, ErrDialFailed},
-			"eestream error: not enough readers to reconstruct data!"},
+		{[]*pb.Node{node0, node1, node2, node3}, 0,
+			[]error{ErrOpFailed, ErrDialFailed, nil, ErrDialFailed}, ""},
+		{[]*pb.Node{node0, node1, node2, node3}, 0,
+			[]error{ErrDialFailed, ErrOpFailed, ErrOpFailed, ErrDialFailed}, ""},
+		{[]*pb.Node{nil, nil, node2, node3}, 0,
+			[]error{nil, nil, nil, nil}, ""},
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
 
 		id := client.NewPieceID()
 
-		errs := make(map[*proto.Node]error, len(tt.nodes))
+		errs := make(map[*pb.Node]error, len(tt.nodes))
 		for i, n := range tt.nodes {
 			errs[n] = tt.errs[i]
 		}
 
-		m := make(map[*proto.Node]client.PSClient, len(tt.nodes))
+		m := make(map[*pb.Node]client.PSClient, len(tt.nodes))
 		for _, n := range tt.nodes {
-			if errs[n] != ErrDialFailed {
+			if errs[n] == ErrOpFailed {
 				derivedID, err := id.Derive([]byte(n.GetId()))
 				if !assert.NoError(t, err, errTag) {
 					continue TestLoop
 				}
 				ps := NewMockPSClient(ctrl)
-				ps.EXPECT().Get(gomock.Any(), derivedID, int64(size/k), gomock.Any()).Return(
-					ranger.NopCloser(ranger.ByteRanger(nil)), errs[n])
+				ps.EXPECT().Get(gomock.Any(), derivedID, int64(size/k), gomock.Any(), gomock.Any()).Return(ranger.ByteRanger(nil), errs[n])
 				m[n] = ps
 			}
 		}
 		ec := ecClient{d: &mockDialer{m: m}, mbm: tt.mbm}
-		rr, err := ec.Get(ctx, tt.nodes, es, id, int64(size))
-
+		rr, err := ec.Get(ctx, tt.nodes, es, id, int64(size), nil, nil)
+		if err == nil {
+			_, err := rr.Range(ctx, 0, 0)
+			assert.NoError(t, err, errTag)
+		}
 		if tt.errString != "" {
 			assert.EqualError(t, err, tt.errString, errTag)
 		} else {
@@ -275,39 +295,41 @@ func TestDelete(t *testing.T) {
 
 TestLoop:
 	for i, tt := range []struct {
-		nodes     []*proto.Node
+		nodes     []*pb.Node
 		errs      []error
 		errString string
 	}{
-		{[]*proto.Node{}, []error{}, ""},
-		{[]*proto.Node{node0}, []error{nil}, ""},
-		{[]*proto.Node{node0}, []error{ErrDialFailed}, dialFailed},
-		{[]*proto.Node{node0}, []error{ErrOpFailed}, opFailed},
-		{[]*proto.Node{node0, node1}, []error{nil, nil}, ""},
-		{[]*proto.Node{node0, node1}, []error{ErrDialFailed, nil}, ""},
-		{[]*proto.Node{node0, node1}, []error{nil, ErrOpFailed}, ""},
-		{[]*proto.Node{node0, node1}, []error{ErrDialFailed, ErrDialFailed}, dialFailed},
-		{[]*proto.Node{node0, node1}, []error{ErrOpFailed, ErrOpFailed}, opFailed},
+		{[]*pb.Node{}, []error{}, ""},
+		{[]*pb.Node{node0}, []error{nil}, ""},
+		{[]*pb.Node{node0}, []error{ErrDialFailed}, dialFailed},
+		{[]*pb.Node{node0}, []error{ErrOpFailed}, opFailed},
+		{[]*pb.Node{node0, node1}, []error{nil, nil}, ""},
+		{[]*pb.Node{node0, node1}, []error{ErrDialFailed, nil}, ""},
+		{[]*pb.Node{node0, node1}, []error{nil, ErrOpFailed}, ""},
+		{[]*pb.Node{node0, node1}, []error{ErrDialFailed, ErrDialFailed}, dialFailed},
+		{[]*pb.Node{node0, node1}, []error{ErrOpFailed, ErrOpFailed}, opFailed},
+		{[]*pb.Node{nil, node1}, []error{nil, nil}, ""},
+		{[]*pb.Node{nil, nil}, []error{nil, nil}, ""},
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
 
 		id := client.NewPieceID()
 
-		errs := make(map[*proto.Node]error, len(tt.nodes))
+		errs := make(map[*pb.Node]error, len(tt.nodes))
 		for i, n := range tt.nodes {
 			errs[n] = tt.errs[i]
 		}
 
-		m := make(map[*proto.Node]client.PSClient, len(tt.nodes))
+		m := make(map[*pb.Node]client.PSClient, len(tt.nodes))
 		for _, n := range tt.nodes {
-			if errs[n] != ErrDialFailed {
+			if n != nil && errs[n] != ErrDialFailed {
 				derivedID, err := id.Derive([]byte(n.GetId()))
 				if !assert.NoError(t, err, errTag) {
 					continue TestLoop
 				}
 				ps := NewMockPSClient(ctrl)
 				gomock.InOrder(
-					ps.EXPECT().Delete(gomock.Any(), derivedID).Return(errs[n]),
+					ps.EXPECT().Delete(gomock.Any(), derivedID, gomock.Any()).Return(errs[n]),
 					ps.EXPECT().Close().Return(nil),
 				)
 				m[n] = ps
@@ -315,7 +337,7 @@ TestLoop:
 		}
 
 		ec := ecClient{d: &mockDialer{m: m}}
-		err := ec.Delete(ctx, tt.nodes, id)
+		err := ec.Delete(ctx, tt.nodes, id, nil)
 
 		if tt.errString != "" {
 			assert.EqualError(t, err, tt.errString, errTag)
@@ -327,21 +349,21 @@ TestLoop:
 
 func TestUnique(t *testing.T) {
 	for i, tt := range []struct {
-		nodes  []*proto.Node
+		nodes  []*pb.Node
 		unique bool
 	}{
 		{nil, true},
-		{[]*proto.Node{}, true},
-		{[]*proto.Node{node0}, true},
-		{[]*proto.Node{node0, node1}, true},
-		{[]*proto.Node{node0, node0}, false},
-		{[]*proto.Node{node0, node1, node0}, false},
-		{[]*proto.Node{node1, node0, node0}, false},
-		{[]*proto.Node{node0, node0, node1}, false},
-		{[]*proto.Node{node2, node0, node1}, true},
-		{[]*proto.Node{node2, node0, node3, node1}, true},
-		{[]*proto.Node{node2, node0, node2, node1}, false},
-		{[]*proto.Node{node1, node0, node3, node1}, false},
+		{[]*pb.Node{}, true},
+		{[]*pb.Node{node0}, true},
+		{[]*pb.Node{node0, node1}, true},
+		{[]*pb.Node{node0, node0}, false},
+		{[]*pb.Node{node0, node1, node0}, false},
+		{[]*pb.Node{node1, node0, node0}, false},
+		{[]*pb.Node{node0, node0, node1}, false},
+		{[]*pb.Node{node2, node0, node1}, true},
+		{[]*pb.Node{node2, node0, node3, node1}, true},
+		{[]*pb.Node{node2, node0, node2, node1}, false},
+		{[]*pb.Node{node1, node0, node3, node1}, false},
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
 		assert.Equal(t, tt.unique, unique(tt.nodes), errTag)

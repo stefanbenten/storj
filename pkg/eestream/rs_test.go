@@ -18,9 +18,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/vivint/infectious"
 
-	"storj.io/storj/internal/pkg/readcloser"
+	"storj.io/storj/internal/readcloser"
+	"storj.io/storj/pkg/encryption"
 	"storj.io/storj/pkg/ranger"
+	"storj.io/storj/pkg/storj"
 )
+
+func randData(amount int) []byte {
+	buf := make([]byte, amount)
+	_, err := rand.Read(buf)
+	if err != nil {
+		panic(err)
+	}
+	return buf
+}
 
 func TestRS(t *testing.T) {
 	ctx := context.Background()
@@ -43,7 +54,7 @@ func TestRS(t *testing.T) {
 		readerMap[i] = ioutil.NopCloser(reader)
 	}
 	decoder := DecodeReaders(ctx, readerMap, rs, 32*1024, 0)
-	defer decoder.Close()
+	defer func() { assert.NoError(t, decoder.Close()) }()
 	data2, err := ioutil.ReadAll(decoder)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +85,7 @@ func TestRSUnexpectedEOF(t *testing.T) {
 		readerMap[i] = ioutil.NopCloser(reader)
 	}
 	decoder := DecodeReaders(ctx, readerMap, rs, 32*1024, 0)
-	defer decoder.Close()
+	defer func() { assert.NoError(t, decoder.Close()) }()
 	// Try ReadFull more data from DecodeReaders than available
 	data2 := make([]byte, len(data)+1024)
 	_, err = io.ReadFull(decoder, data2)
@@ -93,14 +104,13 @@ func TestRSRanger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encKey := sha256.Sum256([]byte("the secret key"))
-	var firstNonce [12]byte
-	encrypter, err := NewAESGCMEncrypter(
-		&encKey, &firstNonce, rs.DecodedBlockSize())
+	encKey := storj.Key(sha256.Sum256([]byte("the secret key")))
+	var firstNonce storj.Nonce
+	encrypter, err := encryption.NewEncrypter(storj.AESGCM, &encKey, &firstNonce, rs.StripeSize())
 	if err != nil {
 		t.Fatal(err)
 	}
-	readers, err := EncodeReader(ctx, TransformReader(PadReader(ioutil.NopCloser(
+	readers, err := EncodeReader(ctx, encryption.TransformReader(PadReader(ioutil.NopCloser(
 		bytes.NewReader(data)), encrypter.InBlockSize()), encrypter, 0), rs, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -109,11 +119,11 @@ func TestRSRanger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rrs := map[int]ranger.RangeCloser{}
+	rrs := map[int]ranger.Ranger{}
 	for i, piece := range pieces {
-		rrs[i] = ranger.ByteRangeCloser(piece)
+		rrs[i] = ranger.ByteRanger(piece)
 	}
-	decrypter, err := NewAESGCMDecrypter(&encKey, &firstNonce, rs.DecodedBlockSize())
+	decrypter, err := encryption.NewDecrypter(storj.AESGCM, &encKey, &firstNonce, rs.StripeSize())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +131,7 @@ func TestRSRanger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rc.Close()
-	rr, err := Transform(rc, decrypter)
+	rr, err := encryption.Transform(rc, decrypter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,22 +154,22 @@ func TestRSRanger(t *testing.T) {
 
 func TestNewRedundancyStrategy(t *testing.T) {
 	for i, tt := range []struct {
-		min       int
+		rep       int
 		opt       int
-		expMin    int
+		expRep    int
 		expOpt    int
 		errString string
 	}{
 		{0, 0, 4, 4, ""},
-		{-1, 0, 0, 0, "eestream error: negative minimum threshold"},
-		{1, 0, 0, 0, "eestream error: minimum threshold less than required count"},
-		{5, 0, 0, 0, "eestream error: minimum threshold greater than total count"},
-		{0, -1, 0, 0, "eestream error: negative optimum threshold"},
-		{0, 1, 0, 0, "eestream error: optimum threshold less than required count"},
-		{0, 5, 0, 0, "eestream error: optimum threshold greater than total count"},
+		{-1, 0, 0, 0, "eestream error: negative repair threshold"},
+		{1, 0, 0, 0, "eestream error: repair threshold less than required count"},
+		{5, 0, 0, 0, "eestream error: repair threshold greater than total count"},
+		{0, -1, 0, 0, "eestream error: negative optimal threshold"},
+		{0, 1, 0, 0, "eestream error: optimal threshold less than required count"},
+		{0, 5, 0, 0, "eestream error: optimal threshold greater than total count"},
 		{3, 4, 3, 4, ""},
-		{0, 3, 0, 0, "eestream error: minimum threshold greater than optimum threshold"},
-		{4, 3, 0, 0, "eestream error: minimum threshold greater than optimum threshold"},
+		{0, 3, 0, 0, "eestream error: repair threshold greater than optimal threshold"},
+		{4, 3, 0, 0, "eestream error: repair threshold greater than optimal threshold"},
 		{4, 4, 4, 4, ""},
 	} {
 		errTag := fmt.Sprintf("Test case #%d", i)
@@ -169,14 +178,14 @@ func TestNewRedundancyStrategy(t *testing.T) {
 			continue
 		}
 		es := NewRSScheme(fc, 8*1024)
-		rs, err := NewRedundancyStrategy(es, tt.min, tt.opt)
+		rs, err := NewRedundancyStrategy(es, tt.rep, tt.opt)
 		if tt.errString != "" {
 			assert.EqualError(t, err, tt.errString, errTag)
 			continue
 		}
 		assert.NoError(t, err, errTag)
-		assert.Equal(t, tt.expMin, rs.MinimumThreshold(), errTag)
-		assert.Equal(t, tt.expOpt, rs.OptimumThreshold(), errTag)
+		assert.Equal(t, tt.expRep, rs.RepairThreshold(), errTag)
+		assert.Equal(t, tt.expOpt, rs.OptimalThreshold(), errTag)
 	}
 }
 
@@ -459,7 +468,7 @@ func testRSProblematic(t *testing.T, tt testCase, i int, fn problematicReadClose
 		readerMap[i] = ioutil.NopCloser(bytes.NewReader(pieces[i]))
 	}
 	decoder := DecodeReaders(ctx, readerMap, rs, int64(tt.dataSize), 3*1024)
-	defer decoder.Close()
+	defer func() { assert.NoError(t, decoder.Close()) }()
 	data2, err := ioutil.ReadAll(decoder)
 	if tt.fail {
 		if err == nil && bytes.Equal(data, data2) {

@@ -6,10 +6,12 @@ package process
 import (
 	"context"
 	"flag"
-	"log"
+	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -18,7 +20,6 @@ import (
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
 	"storj.io/storj/pkg/telemetry"
-	"storj.io/storj/pkg/utils"
 )
 
 // ExecuteWithConfig runs a Cobra command with the provided default config
@@ -30,6 +31,11 @@ func ExecuteWithConfig(cmd *cobra.Command, defaultConfig string) {
 // Exec runs a Cobra command. If a "config" flag is defined it will be parsed
 // and loaded using viper.
 func Exec(cmd *cobra.Command) {
+	exe, err := os.Executable()
+	if err == nil {
+		cmd.Use = exe
+	}
+
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	cleanup(cmd)
 	_ = cmd.Execute()
@@ -78,8 +84,16 @@ func Ctx(cmd *cobra.Command) context.Context {
 	defer contextMtx.Unlock()
 	ctx := contexts[cmd]
 	if ctx == nil {
-		return context.Background()
+		ctx = context.Background()
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-c
+		signal.Stop(c)
+		cancel()
+	}()
 	return ctx
 }
 
@@ -135,13 +149,15 @@ func cleanup(cmd *cobra.Command) {
 			}
 		}
 
-		logger, err := utils.NewLogger(*logDisposition)
+		logger, err := newLogger()
 		if err != nil {
 			return err
 		}
 		defer func() { _ = logger.Sync() }()
 		defer zap.ReplaceGlobals(logger)()
 		defer zap.RedirectStdLog(logger)()
+
+		logger.Debug("logging initialized")
 
 		// okay now that logging is working, inform about the broken keys
 		for _, key := range brokenKeys {
@@ -173,7 +189,10 @@ func cleanup(cmd *cobra.Command) {
 
 		err = internalRun(cmd, args)
 		if err != nil {
-			log.Fatalf("%+v", err)
+			_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+			logger.Sugar().Debugf("%+v", err)
+			_ = logger.Sync()
+			os.Exit(1)
 		}
 		return err
 	}

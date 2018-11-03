@@ -6,19 +6,19 @@ package kademlia
 import (
 	"bytes"
 	"encoding/binary"
-	"math/rand"
+	"sort"
 	"time"
 
-	pb "github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/proto"
 
-	proto "storj.io/storj/protos/overlay"
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/storage"
 )
 
 // addNode attempts to add a new contact to the routing table
 // Requires node not already in table
 // Returns true if node was added successfully
-func (rt *RoutingTable) addNode(node *proto.Node) (bool, error) {
+func (rt *RoutingTable) addNode(node *pb.Node) (bool, error) {
 	rt.mutex.Lock()
 	defer rt.mutex.Unlock()
 	nodeKey := storage.Key(node.Id)
@@ -100,7 +100,7 @@ func (rt *RoutingTable) addNode(node *proto.Node) (bool, error) {
 
 // updateNode will update the node information given that
 // the node is already in the routing table.
-func (rt *RoutingTable) updateNode(node *proto.Node) error {
+func (rt *RoutingTable) updateNode(node *pb.Node) error {
 	marshaledNode, err := marshalNode(*node)
 	if err != nil {
 		return err
@@ -141,17 +141,17 @@ func (rt *RoutingTable) removeNode(kadBucketID storage.Key, nodeID storage.Key) 
 	return nil
 }
 
-// marshalNode: helper, sanitizes proto Node for db insertion
-func marshalNode(node proto.Node) ([]byte, error) {
+// marshalNode: helper, sanitizes Node for db insertion
+func marshalNode(node pb.Node) ([]byte, error) {
 	node.Id = "-"
-	nodeVal, err := pb.Marshal(&node)
+	nodeVal, err := proto.Marshal(&node)
 	if err != nil {
-		return nil, RoutingErr.New("could not marshal proto node: %s", err)
+		return nil, RoutingErr.New("could not marshal node: %s", err)
 	}
 	return nodeVal, nil
 }
 
-// putNode: helper, adds or updates proto Node and ID to nodeBucketDB
+// putNode: helper, adds or updates Node and ID to nodeBucketDB
 func (rt *RoutingTable) putNode(nodeKey storage.Key, nodeValue storage.Value) error {
 	err := rt.nodeBucketDB.Put(nodeKey, nodeValue)
 	if err != nil {
@@ -192,41 +192,56 @@ func (rt *RoutingTable) getKBucketID(nodeID storage.Key) (storage.Key, error) {
 	return nil, RoutingErr.New("could not find k bucket")
 }
 
-// sortByXOR: helper, quick sorts node IDs by xor from the reference Node, smallest xor to largest
-func sortByXOR(nodeIDs storage.Keys, referenceNode storage.Key) storage.Keys {
-	if len(nodeIDs) < 2 {
-		return nodeIDs
+// compareByXor compares left, right xorred by reference
+func compareByXor(left, right, reference storage.Key) int {
+	n := len(reference)
+	if n > len(left) {
+		n = len(left)
 	}
-	left, right := 0, len(nodeIDs)-1
-	pivot := rand.Int() % len(nodeIDs)
-	nodeIDs[pivot], nodeIDs[right] = nodeIDs[right], nodeIDs[pivot]
-	for i := range nodeIDs {
-		xorI := xorTwoIds(nodeIDs[i], referenceNode)
-		xorR := xorTwoIds(nodeIDs[right], referenceNode)
-		if bytes.Compare(xorI, xorR) < 0 {
-			nodeIDs[left], nodeIDs[i] = nodeIDs[i], nodeIDs[left]
-			left++
+	if n > len(right) {
+		n = len(right)
+	}
+	left = left[:n]
+	right = right[:n]
+	reference = reference[:n]
+
+	for i, r := range reference {
+		a, b := left[i]^r, right[i]^r
+		if a != b {
+			if a < b {
+				return -1
+			}
+			return 1
 		}
 	}
-	nodeIDs[left], nodeIDs[right] = nodeIDs[right], nodeIDs[left]
-	sortByXOR(nodeIDs[:left], referenceNode)
-	sortByXOR(nodeIDs[left+1:], referenceNode)
-	return nodeIDs
+
+	return 0
+}
+
+func sortByXOR(nodeIDs storage.Keys, ref storage.Key) {
+	sort.Slice(nodeIDs, func(i, k int) bool {
+		return compareByXor(nodeIDs[i], nodeIDs[k], ref) < 0
+	})
 }
 
 // determineFurthestIDWithinK: helper, determines the furthest node within the k closest to local node
 func (rt *RoutingTable) determineFurthestIDWithinK(nodeIDs storage.Keys) ([]byte, error) {
-	sortedNodes := sortByXOR(nodeIDs, []byte(rt.self.Id))
-	if len(sortedNodes) < rt.bucketSize+1 { //adding 1 since we're not including local node in closest k
-		return sortedNodes[len(sortedNodes)-1], nil
+	sortByXOR(nodeIDs, []byte(rt.self.Id))
+	if len(nodeIDs) < rt.bucketSize+1 { //adding 1 since we're not including local node in closest k
+		return nodeIDs[len(nodeIDs)-1], nil
 	}
-	return sortedNodes[rt.bucketSize], nil
+	return nodeIDs[rt.bucketSize], nil
 }
 
 // xorTwoIds: helper, finds the xor distance between two byte slices
 func xorTwoIds(id []byte, comparisonID []byte) []byte {
 	var xorArr []byte
-	for i := 0; i < len(id); i++ {
+	s := len(id)
+	if s > len(comparisonID) {
+		s = len(comparisonID)
+	}
+
+	for i := 0; i < s; i++ {
 		xor := id[i] ^ comparisonID[i]
 		xorArr = append(xorArr, xor)
 	}
@@ -313,20 +328,21 @@ func (rt *RoutingTable) getNodesFromIDs(nodeIDs storage.Keys) (storage.Keys, []s
 		if err != nil {
 			return nodeIDs, nodes, RoutingErr.New("could not get node id %v, %s", v, err)
 		}
+
 		nodes = append(nodes, n)
 	}
 	return nodeIDs, nodes, nil
 }
 
-// unmarshalNodes: helper, returns slice of reconstructed proto node pointers given a map of nodeIDs:serialized nodes
-func unmarshalNodes(nodeIDs storage.Keys, nodes []storage.Value) ([]*proto.Node, error) {
+// unmarshalNodes: helper, returns slice of reconstructed node pointers given a map of nodeIDs:serialized nodes
+func unmarshalNodes(nodeIDs storage.Keys, nodes []storage.Value) ([]*pb.Node, error) {
 	if len(nodeIDs) != len(nodes) {
-		return []*proto.Node{}, RoutingErr.New("length mismatch between nodeIDs and nodes")
+		return []*pb.Node{}, RoutingErr.New("length mismatch between nodeIDs and nodes")
 	}
-	var unmarshaled []*proto.Node
+	var unmarshaled []*pb.Node
 	for i, n := range nodes {
-		node := &proto.Node{}
-		err := pb.Unmarshal(n, node)
+		node := &pb.Node{}
+		err := proto.Unmarshal(n, node)
 		if err != nil {
 			return unmarshaled, RoutingErr.New("could not unmarshal node %s", err)
 		}
@@ -336,19 +352,19 @@ func unmarshalNodes(nodeIDs storage.Keys, nodes []storage.Value) ([]*proto.Node,
 	return unmarshaled, nil
 }
 
-// getUnmarshaledNodesFromBucket: helper, gets proto nodes within kbucket
-func (rt *RoutingTable) getUnmarshaledNodesFromBucket(bucketID storage.Key) ([]*proto.Node, error) {
+// getUnmarshaledNodesFromBucket: helper, gets nodes within kbucket
+func (rt *RoutingTable) getUnmarshaledNodesFromBucket(bucketID storage.Key) ([]*pb.Node, error) {
 	nodeIDs, err := rt.getNodeIDsWithinKBucket(bucketID)
 	if err != nil {
-		return []*proto.Node{}, RoutingErr.New("could not get nodeIds within kbucket %s", err)
+		return []*pb.Node{}, RoutingErr.New("could not get nodeIds within kbucket %s", err)
 	}
 	ids, serializedNodes, err := rt.getNodesFromIDs(nodeIDs)
 	if err != nil {
-		return []*proto.Node{}, RoutingErr.New("could not get node values %s", err)
+		return []*pb.Node{}, RoutingErr.New("could not get node values %s", err)
 	}
 	unmarshaledNodes, err := unmarshalNodes(ids, serializedNodes)
 	if err != nil {
-		return []*proto.Node{}, RoutingErr.New("could not unmarshal nodes %s", err)
+		return []*pb.Node{}, RoutingErr.New("could not unmarshal nodes %s", err)
 	}
 	return unmarshaledNodes, nil
 }

@@ -5,15 +5,21 @@ package statdb
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
+	"storj.io/storj/pkg/pointerdb/auth"
 	dbx "storj.io/storj/pkg/statdb/dbx"
 	pb "storj.io/storj/pkg/statdb/proto"
-	"storj.io/storj/pointerdb/auth"
+)
+
+var (
+	mon = monkit.Package()
 )
 
 // Server implements the statdb RPC service
@@ -50,6 +56,7 @@ func (s *Server) validateAuth(APIKeyBytes []byte) error {
 
 // Create a db entry for the provided storagenode
 func (s *Server) Create(ctx context.Context, createReq *pb.CreateRequest) (resp *pb.CreateResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
 	s.logger.Debug("entering statdb Create")
 
 	APIKeyBytes := createReq.APIKey
@@ -64,7 +71,7 @@ func (s *Server) Create(ctx context.Context, createReq *pb.CreateRequest) (resp 
 
 	dbNode, err := s.DB.Create_Node(
 		ctx,
-		dbx.Node_Id(string(node.NodeId)),
+		dbx.Node_Id(node.NodeId),
 		dbx.Node_AuditSuccessCount(auditSuccessCount),
 		dbx.Node_TotalAuditCount(totalAuditCount),
 		dbx.Node_AuditSuccessRatio(auditSuccessRatio),
@@ -78,7 +85,7 @@ func (s *Server) Create(ctx context.Context, createReq *pb.CreateRequest) (resp 
 	s.logger.Debug("created in the db: " + string(node.NodeId))
 
 	nodeStats := &pb.NodeStats{
-		NodeId:            []byte(dbNode.Id),
+		NodeId:            dbNode.Id,
 		AuditSuccessRatio: dbNode.AuditSuccessRatio,
 		UptimeRatio:       dbNode.UptimeRatio,
 	}
@@ -89,6 +96,7 @@ func (s *Server) Create(ctx context.Context, createReq *pb.CreateRequest) (resp 
 
 // Get a storagenode's stats from the db
 func (s *Server) Get(ctx context.Context, getReq *pb.GetRequest) (resp *pb.GetResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
 	s.logger.Debug("entering statdb Get")
 
 	APIKeyBytes := getReq.APIKey
@@ -97,13 +105,13 @@ func (s *Server) Get(ctx context.Context, getReq *pb.GetRequest) (resp *pb.GetRe
 		return nil, err
 	}
 
-	dbNode, err := s.DB.Get_Node_By_Id(ctx, dbx.Node_Id(string(getReq.NodeId)))
+	dbNode, err := s.DB.Get_Node_By_Id(ctx, dbx.Node_Id(getReq.NodeId))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
 	nodeStats := &pb.NodeStats{
-		NodeId:            []byte(dbNode.Id),
+		NodeId:            dbNode.Id,
 		AuditSuccessRatio: dbNode.AuditSuccessRatio,
 		UptimeRatio:       dbNode.UptimeRatio,
 	}
@@ -112,8 +120,65 @@ func (s *Server) Get(ctx context.Context, getReq *pb.GetRequest) (resp *pb.GetRe
 	}, nil
 }
 
+// FindValidNodes finds a subset of storagenodes that meet reputation requirements
+func (s *Server) FindValidNodes(ctx context.Context, getReq *pb.FindValidNodesRequest) (resp *pb.FindValidNodesResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
+	s.logger.Debug("entering statdb FindValidNodes")
+
+	passedIds := [][]byte{}
+
+	nodeIds := getReq.NodeIds
+	minAuditCount := getReq.MinStats.AuditCount
+	minAuditSuccess := getReq.MinStats.AuditSuccessRatio
+	minUptime := getReq.MinStats.UptimeRatio
+
+	rows, err := s.findValidNodesQuery(nodeIds, minAuditCount, minAuditSuccess, minUptime)
+
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		err = rows.Close()
+		if err != nil {
+			s.logger.Error(err.Error())
+		}
+	}()
+
+	for rows.Next() {
+		node := &dbx.Node{}
+		err = rows.Scan(&node.Id, &node.TotalAuditCount, &node.AuditSuccessRatio, &node.UptimeRatio, &node.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		passedIds = append(passedIds, node.Id)
+	}
+
+	return &pb.FindValidNodesResponse{
+		PassedIds: passedIds,
+	}, nil
+}
+
+func (s *Server) findValidNodesQuery(nodeIds [][]byte, auditCount int64, auditSuccess, uptime float64) (*sql.Rows, error) {
+	args := make([]interface{}, len(nodeIds))
+	for i, id := range nodeIds {
+		args[i] = id
+	}
+	args = append(args, auditCount, auditSuccess, uptime)
+
+	rows, err := s.DB.Query(`SELECT nodes.id, nodes.total_audit_count, 
+		nodes.audit_success_ratio, nodes.uptime_ratio, nodes.created_at
+		FROM nodes
+		WHERE nodes.id IN (?`+strings.Repeat(", ?", len(nodeIds)-1)+`)
+		AND nodes.total_audit_count >= ?
+		AND nodes.audit_success_ratio >= ?
+		AND nodes.uptime_ratio >= ?`, args...)
+
+	return rows, err
+}
+
 // Update a single storagenode's stats in the db
 func (s *Server) Update(ctx context.Context, updateReq *pb.UpdateRequest) (resp *pb.UpdateResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
 	s.logger.Debug("entering statdb Update")
 
 	APIKeyBytes := updateReq.APIKey
@@ -122,9 +187,19 @@ func (s *Server) Update(ctx context.Context, updateReq *pb.UpdateRequest) (resp 
 		return nil, err
 	}
 
-	node := updateReq.Node
+	node := updateReq.GetNode()
 
-	dbNode, err := s.DB.Get_Node_By_Id(ctx, dbx.Node_Id(string(node.NodeId)))
+	createIfReq := &pb.CreateEntryIfNotExistsRequest{
+		Node:   updateReq.GetNode(),
+		APIKey: APIKeyBytes,
+	}
+
+	_, err = s.CreateEntryIfNotExists(ctx, createIfReq)
+	if err != nil {
+		return nil, err
+	}
+
+	dbNode, err := s.DB.Get_Node_By_Id(ctx, dbx.Node_Id(node.NodeId))
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
@@ -132,7 +207,7 @@ func (s *Server) Update(ctx context.Context, updateReq *pb.UpdateRequest) (resp 
 	auditSuccessCount := dbNode.AuditSuccessCount
 	totalAuditCount := dbNode.TotalAuditCount
 	var auditSuccessRatio float64
-	var uptimeSuccessCount int64
+	uptimeSuccessCount := dbNode.UptimeSuccessCount
 	totalUptimeCount := dbNode.TotalUptimeCount
 	var uptimeRatio float64
 
@@ -161,13 +236,13 @@ func (s *Server) Update(ctx context.Context, updateReq *pb.UpdateRequest) (resp 
 		updateFields.UptimeRatio = dbx.Node_UptimeRatio(uptimeRatio)
 	}
 
-	dbNode, err = s.DB.Update_Node_By_Id(ctx, dbx.Node_Id(string(node.NodeId)), updateFields)
+	dbNode, err = s.DB.Update_Node_By_Id(ctx, dbx.Node_Id(node.NodeId), updateFields)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
 	nodeStats := &pb.NodeStats{
-		NodeId:            []byte(dbNode.Id),
+		NodeId:            dbNode.Id,
 		AuditSuccessRatio: dbNode.AuditSuccessRatio,
 		UptimeRatio:       dbNode.UptimeRatio,
 	}
@@ -176,13 +251,15 @@ func (s *Server) Update(ctx context.Context, updateReq *pb.UpdateRequest) (resp 
 	}, nil
 }
 
-// UpdateBatch for updating  multiple farmers' stats in the db
+// UpdateBatch for updating multiple farmers' stats in the db
 func (s *Server) UpdateBatch(ctx context.Context, updateBatchReq *pb.UpdateBatchRequest) (resp *pb.UpdateBatchResponse, err error) {
+	defer mon.Task()(&ctx)(&err)
 	s.logger.Debug("entering statdb UpdateBatch")
 
 	APIKeyBytes := updateBatchReq.APIKey
-	nodeStatsList := make([]*pb.NodeStats, len(updateBatchReq.NodeList))
-	for i, node := range updateBatchReq.NodeList {
+	var nodeStatsList []*pb.NodeStats
+	var failedNodes []*pb.Node
+	for _, node := range updateBatchReq.NodeList {
 		updateReq := &pb.UpdateRequest{
 			Node:   node,
 			APIKey: APIKeyBytes,
@@ -190,16 +267,50 @@ func (s *Server) UpdateBatch(ctx context.Context, updateBatchReq *pb.UpdateBatch
 
 		updateRes, err := s.Update(ctx, updateReq)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
+			s.logger.Error(err.Error())
+			failedNodes = append(failedNodes, node)
+		} else {
+			nodeStatsList = append(nodeStatsList, updateRes.Stats)
 		}
-
-		nodeStatsList[i] = updateRes.Stats
 	}
 
 	updateBatchRes := &pb.UpdateBatchResponse{
-		StatsList: nodeStatsList,
+		FailedNodes: failedNodes,
+		StatsList:   nodeStatsList,
 	}
 	return updateBatchRes, nil
+}
+
+// CreateEntryIfNotExists creates a statdb node entry and saves to statdb if it didn't already exist
+func (s *Server) CreateEntryIfNotExists(ctx context.Context, createIfReq *pb.CreateEntryIfNotExistsRequest) (resp *pb.CreateEntryIfNotExistsResponse, err error) {
+	APIKeyBytes := createIfReq.APIKey
+	getReq := &pb.GetRequest{
+		NodeId: createIfReq.Node.NodeId,
+		APIKey: APIKeyBytes,
+	}
+	getRes, err := s.Get(ctx, getReq)
+	if err != nil {
+		// TODO: figure out how to confirm error is type dbx.ErrorCode_NoRows
+		if strings.Contains(err.Error(), "no rows in result set") {
+			createReq := &pb.CreateRequest{
+				Node:   createIfReq.Node,
+				APIKey: APIKeyBytes,
+			}
+			res, err := s.Create(ctx, createReq)
+			if err != nil {
+				return nil, err
+			}
+			createEntryIfNotExistsRes := &pb.CreateEntryIfNotExistsResponse{
+				Stats: res.Stats,
+			}
+			return createEntryIfNotExistsRes, nil
+		}
+		return nil, err
+	}
+	createEntryIfNotExistsRes := &pb.CreateEntryIfNotExistsResponse{
+		Stats: getRes.Stats,
+	}
+	return createEntryIfNotExistsRes, nil
 }
 
 func initRatioVars(shouldUpdate, status bool) (int64, int64, float64) {

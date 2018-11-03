@@ -13,15 +13,15 @@ import (
 	"log"
 	"time"
 
+	"github.com/gtank/cryptopasta"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	"github.com/gtank/cryptopasta"
-
+	"storj.io/storj/pkg/node"
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/ranger"
-	pb "storj.io/storj/protos/piecestore"
 )
 
 // ClientError is any error returned by the client
@@ -30,31 +30,33 @@ var ClientError = errs.Class("PSClient error")
 var (
 	defaultBandwidthMsgSize = flag.Int(
 		"piecestore.rpc.client.default_bandwidth_msg_size", 32*1024,
-		"default bandwidth message size in kilobytes")
+		"default bandwidth message size in bytes")
 	maxBandwidthMsgSize = flag.Int(
 		"piecestore.rpc.client.max_bandwidth_msg_size", 64*1024,
-		"max bandwidth message size in kilobytes")
+		"max bandwidth message size in bytes")
 )
 
 // PSClient is an interface describing the functions for interacting with piecestore nodes
 type PSClient interface {
 	Meta(ctx context.Context, id PieceID) (*pb.PieceSummary, error)
-	Put(ctx context.Context, id PieceID, data io.Reader, ttl time.Time, ba *pb.PayerBandwidthAllocation) error
-	Get(ctx context.Context, id PieceID, size int64, ba *pb.PayerBandwidthAllocation) (ranger.RangeCloser, error)
-	Delete(ctx context.Context, pieceID PieceID) error
+	Put(ctx context.Context, id PieceID, data io.Reader, ttl time.Time, ba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) error
+	Get(ctx context.Context, id PieceID, size int64, ba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (ranger.Ranger, error)
+	Delete(ctx context.Context, pieceID PieceID, authorization *pb.SignedMessage) error
+	Stats(ctx context.Context) (*pb.StatSummary, error)
 	io.Closer
 }
 
 // Client -- Struct Info needed for protobuf api calls
 type Client struct {
-	route            pb.PieceStoreRoutesClient
-	conn             *grpc.ClientConn
-	prikey           crypto.PrivateKey
-	bandwidthMsgSize int
+	route            pb.PieceStoreRoutesClient // Client for interacting with Storage Node
+	conn             *grpc.ClientConn          // Connection to Storage Node
+	prikey           crypto.PrivateKey         // Uplink private key
+	bandwidthMsgSize int                       // max bandwidth message size in bytes
+	nodeID           *node.ID                  // Storage node being connected to
 }
 
 // NewPSClient initilizes a PSClient
-func NewPSClient(conn *grpc.ClientConn, bandwidthMsgSize int, prikey crypto.PrivateKey) (PSClient, error) {
+func NewPSClient(conn *grpc.ClientConn, nodeID *node.ID, bandwidthMsgSize int, prikey crypto.PrivateKey) (PSClient, error) {
 	if bandwidthMsgSize < 0 || bandwidthMsgSize > *maxBandwidthMsgSize {
 		return nil, ClientError.New(fmt.Sprintf("Invalid Bandwidth Message Size: %v", bandwidthMsgSize))
 	}
@@ -68,11 +70,12 @@ func NewPSClient(conn *grpc.ClientConn, bandwidthMsgSize int, prikey crypto.Priv
 		route:            pb.NewPieceStoreRoutesClient(conn),
 		bandwidthMsgSize: bandwidthMsgSize,
 		prikey:           prikey,
+		nodeID:           nodeID,
 	}, nil
 }
 
 // NewCustomRoute creates new Client with custom route interface
-func NewCustomRoute(route pb.PieceStoreRoutesClient, bandwidthMsgSize int, prikey crypto.PrivateKey) (*Client, error) {
+func NewCustomRoute(route pb.PieceStoreRoutesClient, nodeID *node.ID, bandwidthMsgSize int, prikey crypto.PrivateKey) (*Client, error) {
 	if bandwidthMsgSize < 0 || bandwidthMsgSize > *maxBandwidthMsgSize {
 		return nil, ClientError.New(fmt.Sprintf("Invalid Bandwidth Message Size: %v", bandwidthMsgSize))
 	}
@@ -85,6 +88,7 @@ func NewCustomRoute(route pb.PieceStoreRoutesClient, bandwidthMsgSize int, prike
 		route:            route,
 		bandwidthMsgSize: bandwidthMsgSize,
 		prikey:           prikey,
+		nodeID:           nodeID,
 	}, nil
 }
 
@@ -99,13 +103,16 @@ func (client *Client) Meta(ctx context.Context, id PieceID) (*pb.PieceSummary, e
 }
 
 // Put uploads a Piece to a piece store Server
-func (client *Client) Put(ctx context.Context, id PieceID, data io.Reader, ttl time.Time, ba *pb.PayerBandwidthAllocation) error {
+func (client *Client) Put(ctx context.Context, id PieceID, data io.Reader, ttl time.Time, ba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) error {
 	stream, err := client.route.Store(ctx)
 	if err != nil {
 		return err
 	}
 
-	msg := &pb.PieceStore{Piecedata: &pb.PieceStore_PieceData{Id: id.String(), ExpirationUnixSec: ttl.Unix()}}
+	msg := &pb.PieceStore{
+		Piecedata:     &pb.PieceStore_PieceData{Id: id.String(), ExpirationUnixSec: ttl.Unix()},
+		Authorization: authorization,
+	}
 	if err = stream.Send(msg); err != nil {
 		if _, closeErr := stream.CloseAndRecv(); closeErr != nil {
 			zap.S().Errorf("error closing stream %s :: %v.Send() = %v", closeErr, stream, closeErr)
@@ -128,7 +135,10 @@ func (client *Client) Put(ctx context.Context, id PieceID, data io.Reader, ttl t
 	if err == io.ErrUnexpectedEOF {
 		_ = writer.Close()
 		zap.S().Infof("Node cut from upload due to slow connection. Deleting piece %s...", id)
-		return client.Delete(ctx, id)
+		deleteErr := client.Delete(ctx, id, authorization)
+		if deleteErr != nil {
+			return deleteErr
+		}
 	}
 	if err != nil {
 		return err
@@ -138,23 +148,28 @@ func (client *Client) Put(ctx context.Context, id PieceID, data io.Reader, ttl t
 }
 
 // Get begins downloading a Piece from a piece store Server
-func (client *Client) Get(ctx context.Context, id PieceID, size int64, ba *pb.PayerBandwidthAllocation) (ranger.RangeCloser, error) {
+func (client *Client) Get(ctx context.Context, id PieceID, size int64, ba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (ranger.Ranger, error) {
 	stream, err := client.route.Retrieve(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return PieceRangerSize(client, stream, id, size, ba), nil
+	return PieceRangerSize(client, stream, id, size, ba, authorization), nil
 }
 
 // Delete a Piece from a piece store Server
-func (client *Client) Delete(ctx context.Context, id PieceID) error {
-	reply, err := client.route.Delete(ctx, &pb.PieceDelete{Id: id.String()})
+func (client *Client) Delete(ctx context.Context, id PieceID, authorization *pb.SignedMessage) error {
+	reply, err := client.route.Delete(ctx, &pb.PieceDelete{Id: id.String(), Authorization: authorization})
 	if err != nil {
 		return err
 	}
 	log.Printf("Route summary : %v", reply)
 	return nil
+}
+
+// Stats will retrieve stats about a piece storage node
+func (client *Client) Stats(ctx context.Context) (*pb.StatSummary, error) {
+	return client.route.Stats(ctx, &pb.StatsReq{})
 }
 
 // sign a message using the clients private key

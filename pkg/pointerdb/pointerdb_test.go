@@ -5,37 +5,31 @@ package pointerdb
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"testing"
 
-	"go.uber.org/zap"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
-	"github.com/golang/mock/gomock"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 
-	"storj.io/storj/pkg/paths"
+	"storj.io/storj/pkg/auth"
+	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/storage/meta"
-	pb "storj.io/storj/protos/pointerdb"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/teststore"
 )
 
-//go:generate mockgen -destination kvstore_mock_test.go -package pointerdb storj.io/storj/storage KeyValueStore
-
-var (
-	ctx = context.Background()
-)
-
 func TestServicePut(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
 	for i, tt := range []struct {
 		apiKey    []byte
 		err       error
@@ -43,21 +37,24 @@ func TestServicePut(t *testing.T) {
 	}{
 		{nil, nil, ""},
 		{[]byte("wrong key"), nil, status.Errorf(codes.Unauthenticated, "Invalid API credential").Error()},
-		{nil, errors.New("put error"), status.Errorf(codes.Internal, "put error").Error()},
+		{nil, errors.New("put error"), status.Errorf(codes.Internal, "internal error").Error()},
 	} {
+		ctx := context.Background()
+		ctx = auth.WithAPIKey(ctx, tt.apiKey)
+
 		errTag := fmt.Sprintf("Test case #%d", i)
 
-		db := NewMockKeyValueStore(ctrl)
+		db := teststore.New()
 		s := Server{DB: db, logger: zap.NewNop()}
 
 		path := "a/b/c"
 		pr := pb.Pointer{}
 
-		if tt.err != nil || tt.errString == "" {
-			db.EXPECT().Put(storage.Key([]byte(path)), gomock.Any()).Return(tt.err)
+		if tt.err != nil {
+			db.ForceError++
 		}
 
-		req := pb.PutRequest{Path: path, Pointer: &pr, APIKey: tt.apiKey}
+		req := pb.PutRequest{Path: path, Pointer: &pr}
 		_, err := s.Put(ctx, &req)
 
 		if err != nil {
@@ -69,8 +66,17 @@ func TestServicePut(t *testing.T) {
 }
 
 func TestServiceGet(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
+	ctx := context.Background()
+	ca, err := provider.NewTestCA(ctx)
+	assert.NoError(t, err)
+	identity, err := ca.NewIdentity()
+	assert.NoError(t, err)
+
+	peerCertificates := make([]*x509.Certificate, 2)
+	peerCertificates[0] = identity.Leaf
+	peerCertificates[1] = identity.CA
+
+	info := credentials.TLSInfo{State: tls.ConnectionState{PeerCertificates: peerCertificates}}
 
 	for i, tt := range []struct {
 		apiKey    []byte
@@ -79,41 +85,45 @@ func TestServiceGet(t *testing.T) {
 	}{
 		{nil, nil, ""},
 		{[]byte("wrong key"), nil, status.Errorf(codes.Unauthenticated, "Invalid API credential").Error()},
-		{nil, errors.New("get error"), status.Errorf(codes.Internal, "get error").Error()},
+		{nil, errors.New("get error"), status.Errorf(codes.Internal, "internal error").Error()},
 	} {
+		ctx = auth.WithAPIKey(ctx, tt.apiKey)
+		ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: info})
+
+		// TODO(michal) workaround avoid problems with lack of grpc context
+		identity.ID = ""
+
 		errTag := fmt.Sprintf("Test case #%d", i)
 
-		db := NewMockKeyValueStore(ctrl)
-		s := Server{DB: db, logger: zap.NewNop()}
+		db := teststore.New()
+		s := Server{DB: db, logger: zap.NewNop(), identity: identity}
 
 		path := "a/b/c"
-		pr := pb.Pointer{}
-		prBytes, err := proto.Marshal(&pr)
+
+		pr := &pb.Pointer{Size: 123}
+		prBytes, err := proto.Marshal(pr)
 		assert.NoError(t, err, errTag)
 
-		if tt.err != nil || tt.errString == "" {
-			db.EXPECT().Get(storage.Key([]byte(path))).Return(prBytes, tt.err)
+		_ = db.Put(storage.Key(path), storage.Value(prBytes))
+
+		if tt.err != nil {
+			db.ForceError++
 		}
 
-		req := pb.GetRequest{Path: path, APIKey: tt.apiKey}
+		req := pb.GetRequest{Path: path}
 		resp, err := s.Get(ctx, &req)
 
 		if err != nil {
 			assert.EqualError(t, err, tt.errString, errTag)
 		} else {
 			assert.NoError(t, err, errTag)
-			respPr := pb.Pointer{}
-			err := proto.Unmarshal(resp.GetPointer(), &respPr)
 			assert.NoError(t, err, errTag)
-			assert.Equal(t, pr, respPr, errTag)
+			assert.True(t, proto.Equal(pr, resp.Pointer), errTag)
 		}
 	}
 }
 
 func TestServiceDelete(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
 	for i, tt := range []struct {
 		apiKey    []byte
 		err       error
@@ -121,20 +131,24 @@ func TestServiceDelete(t *testing.T) {
 	}{
 		{nil, nil, ""},
 		{[]byte("wrong key"), nil, status.Errorf(codes.Unauthenticated, "Invalid API credential").Error()},
-		{nil, errors.New("delete error"), status.Errorf(codes.Internal, "delete error").Error()},
+		{nil, errors.New("delete error"), status.Errorf(codes.Internal, "internal error").Error()},
 	} {
-		errTag := fmt.Sprintf("Test case #%d", i)
+		ctx := context.Background()
+		ctx = auth.WithAPIKey(ctx, tt.apiKey)
 
-		db := NewMockKeyValueStore(ctrl)
-		s := Server{DB: db, logger: zap.NewNop()}
+		errTag := fmt.Sprintf("Test case #%d", i)
 
 		path := "a/b/c"
 
-		if tt.err != nil || tt.errString == "" {
-			db.EXPECT().Delete(storage.Key([]byte(path))).Return(tt.err)
+		db := teststore.New()
+		_ = db.Put(storage.Key(path), storage.Value("hello"))
+		s := Server{DB: db, logger: zap.NewNop()}
+
+		if tt.err != nil {
+			db.ForceError++
 		}
 
-		req := pb.DeleteRequest{Path: path, APIKey: tt.apiKey}
+		req := pb.DeleteRequest{Path: path}
 		_, err := s.Delete(ctx, &req)
 
 		if err != nil {
@@ -149,10 +163,6 @@ func TestServiceList(t *testing.T) {
 	db := teststore.New()
 	server := Server{DB: db, logger: zap.NewNop()}
 
-	key := func(s string) storage.Key {
-		return storage.Key(paths.New(s).Bytes())
-	}
-
 	pointer := &pb.Pointer{}
 	pointer.CreationDate = ptypes.TimestampNow()
 
@@ -163,19 +173,20 @@ func TestServiceList(t *testing.T) {
 	pointerValue := storage.Value(pointerBytes)
 
 	err = storage.PutAll(db, []storage.ListItem{
-		{Key: key("sample.😶"), Value: pointerValue},
-		{Key: key("müsic"), Value: pointerValue},
-		{Key: key("müsic/söng1.mp3"), Value: pointerValue},
-		{Key: key("müsic/söng2.mp3"), Value: pointerValue},
-		{Key: key("müsic/album/söng3.mp3"), Value: pointerValue},
-		{Key: key("müsic/söng4.mp3"), Value: pointerValue},
-		{Key: key("ビデオ/movie.mkv"), Value: pointerValue},
+		{Key: storage.Key("sample.😶"), Value: pointerValue},
+		{Key: storage.Key("müsic"), Value: pointerValue},
+		{Key: storage.Key("müsic/söng1.mp3"), Value: pointerValue},
+		{Key: storage.Key("müsic/söng2.mp3"), Value: pointerValue},
+		{Key: storage.Key("müsic/album/söng3.mp3"), Value: pointerValue},
+		{Key: storage.Key("müsic/söng4.mp3"), Value: pointerValue},
+		{Key: storage.Key("ビデオ/movie.mkv"), Value: pointerValue},
 	}...)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	type Test struct {
+		APIKey   string
 		Request  pb.ListRequest
 		Expected *pb.ListResponse
 		Error    func(i int, err error)
@@ -219,7 +230,8 @@ func TestServiceList(t *testing.T) {
 				},
 			},
 		}, {
-			Request: pb.ListRequest{Recursive: true, MetaFlags: meta.All, APIKey: []byte("wrong key")},
+			APIKey:  "wrong key",
+			Request: pb.ListRequest{Recursive: true, MetaFlags: meta.All}, //, APIKey: []byte("wrong key")},
 			Error:   errorWithCode(codes.Unauthenticated),
 		}, {
 			Request: pb.ListRequest{Recursive: true, Limit: 3},
@@ -256,46 +268,46 @@ func TestServiceList(t *testing.T) {
 			Request: pb.ListRequest{Recursive: true, Prefix: "müsic/"},
 			Expected: &pb.ListResponse{
 				Items: []*pb.ListResponse_Item{
-					{Path: "müsic/album/söng3.mp3"},
-					{Path: "müsic/söng1.mp3"},
-					{Path: "müsic/söng2.mp3"},
-					{Path: "müsic/söng4.mp3"},
+					{Path: "album/söng3.mp3"},
+					{Path: "söng1.mp3"},
+					{Path: "söng2.mp3"},
+					{Path: "söng4.mp3"},
 				},
 			},
 		}, {
 			Request: pb.ListRequest{Recursive: true, Prefix: "müsic/", StartAfter: "album/söng3.mp3"},
 			Expected: &pb.ListResponse{
 				Items: []*pb.ListResponse_Item{
-					{Path: "müsic/söng1.mp3"},
-					{Path: "müsic/söng2.mp3"},
-					{Path: "müsic/söng4.mp3"},
+					{Path: "söng1.mp3"},
+					{Path: "söng2.mp3"},
+					{Path: "söng4.mp3"},
 				},
 			},
 		}, {
 			Request: pb.ListRequest{Prefix: "müsic/"},
 			Expected: &pb.ListResponse{
 				Items: []*pb.ListResponse_Item{
-					{Path: "müsic/album/", IsPrefix: true},
-					{Path: "müsic/söng1.mp3"},
-					{Path: "müsic/söng2.mp3"},
-					{Path: "müsic/söng4.mp3"},
+					{Path: "album/", IsPrefix: true},
+					{Path: "söng1.mp3"},
+					{Path: "söng2.mp3"},
+					{Path: "söng4.mp3"},
 				},
 			},
 		}, {
 			Request: pb.ListRequest{Prefix: "müsic/", StartAfter: "söng1.mp3"},
 			Expected: &pb.ListResponse{
 				Items: []*pb.ListResponse_Item{
-					{Path: "müsic/söng2.mp3"},
-					{Path: "müsic/söng4.mp3"},
+					{Path: "söng2.mp3"},
+					{Path: "söng4.mp3"},
 				},
 			},
 		}, {
 			Request: pb.ListRequest{Prefix: "müsic/", EndBefore: "söng4.mp3"},
 			Expected: &pb.ListResponse{
 				Items: []*pb.ListResponse_Item{
-					{Path: "müsic/album/", IsPrefix: true},
-					{Path: "müsic/söng1.mp3"},
-					{Path: "müsic/söng2.mp3"},
+					{Path: "album/", IsPrefix: true},
+					{Path: "söng1.mp3"},
+					{Path: "söng2.mp3"},
 				},
 			},
 		}, {
@@ -313,6 +325,9 @@ func TestServiceList(t *testing.T) {
 	//    pb.ListRequest{Prefix: "müsic/", StartAfter: "söng1.mp3", EndBefore: "söng4.mp3"},
 	//    failing database
 	for i, test := range tests {
+		ctx := context.Background()
+		ctx = auth.WithAPIKey(ctx, []byte(test.APIKey))
+
 		resp, err := server.List(ctx, &test.Request)
 		if test.Error == nil {
 			if err != nil {

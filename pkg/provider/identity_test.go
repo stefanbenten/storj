@@ -9,8 +9,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -41,7 +43,7 @@ func TestPeerIdentityFromCertChain(t *testing.T) {
 	l, err := peertls.NewCert(lT, caT, &lp.PublicKey, k)
 	assert.NoError(t, err)
 
-	pi, err := PeerIdentityFromCerts(l, c)
+	pi, err := PeerIdentityFromCerts(l, c, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, c, pi.CA)
 	assert.Equal(t, l, pi.Leaf)
@@ -73,8 +75,8 @@ func TestFullIdentityFromPEM(t *testing.T) {
 	assert.NotEmpty(t, l)
 
 	chainPEM := bytes.NewBuffer([]byte{})
-	pem.Encode(chainPEM, peertls.NewCertBlock(l.Raw))
-	pem.Encode(chainPEM, peertls.NewCertBlock(c.Raw))
+	assert.NoError(t, pem.Encode(chainPEM, peertls.NewCertBlock(l.Raw)))
+	assert.NoError(t, pem.Encode(chainPEM, peertls.NewCertBlock(c.Raw)))
 
 	lkE, ok := lk.(*ecdsa.PrivateKey)
 	assert.True(t, ok)
@@ -85,9 +87,9 @@ func TestFullIdentityFromPEM(t *testing.T) {
 	assert.NotEmpty(t, lkB)
 
 	keyPEM := bytes.NewBuffer([]byte{})
-	pem.Encode(keyPEM, peertls.NewKeyBlock(lkB))
+	assert.NoError(t, pem.Encode(keyPEM, peertls.NewKeyBlock(lkB)))
 
-	fi, err := FullIdentityFromPEM(chainPEM.Bytes(), keyPEM.Bytes())
+	fi, err := FullIdentityFromPEM(chainPEM.Bytes(), keyPEM.Bytes(), nil)
 	assert.NoError(t, err)
 	assert.Equal(t, l.Raw, fi.Leaf.Raw)
 	assert.Equal(t, c.Raw, fi.CA.Raw)
@@ -99,8 +101,8 @@ func TestIdentityConfig_SaveIdentity(t *testing.T) {
 	defer done()
 
 	chainPEM := bytes.NewBuffer([]byte{})
-	pem.Encode(chainPEM, peertls.NewCertBlock(fi.Leaf.Raw))
-	pem.Encode(chainPEM, peertls.NewCertBlock(fi.CA.Raw))
+	assert.NoError(t, pem.Encode(chainPEM, peertls.NewCertBlock(fi.Leaf.Raw)))
+	assert.NoError(t, pem.Encode(chainPEM, peertls.NewCertBlock(fi.CA.Raw)))
 
 	privateKey, ok := fi.Key.(*ecdsa.PrivateKey)
 	assert.True(t, ok)
@@ -111,7 +113,7 @@ func TestIdentityConfig_SaveIdentity(t *testing.T) {
 	assert.NotEmpty(t, keyBytes)
 
 	keyPEM := bytes.NewBuffer([]byte{})
-	pem.Encode(keyPEM, peertls.NewKeyBlock(keyBytes))
+	assert.NoError(t, pem.Encode(keyPEM, peertls.NewKeyBlock(keyBytes)))
 
 	err = ic.Save(fi)
 	assert.NoError(t, err)
@@ -138,12 +140,12 @@ func TestIdentityConfig_SaveIdentity(t *testing.T) {
 }
 
 func tempIdentityConfig() (*IdentityConfig, func(), error) {
-	tmpDir, err := ioutil.TempDir("", "tempIdentity")
+	tmpDir, err := ioutil.TempDir("", "storj-identity")
 	if err != nil {
 		return nil, nil, err
 	}
 
-	cleanup := func() { os.RemoveAll(tmpDir) }
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 
 	return &IdentityConfig{
 		CertPath: filepath.Join(tmpDir, "chain.pem"),
@@ -183,7 +185,7 @@ AwEHoUQDQgAEoLy/0hs5deTXZunRumsMkiHpF0g8wAc58aXANmr7Mxx9tzoIYFnx
 	ic, cleanup, err := tempIdentityConfig()
 	assert.NoError(t, err)
 
-	fi, err := FullIdentityFromPEM([]byte(chain), []byte(key))
+	fi, err := FullIdentityFromPEM([]byte(chain), []byte(key), nil)
 	assert.NoError(t, err)
 
 	return cleanup, ic, fi, difficulty
@@ -198,6 +200,7 @@ func TestIdentityConfig_LoadIdentity(t *testing.T) {
 
 	fi, err := ic.Load()
 	assert.NoError(t, err)
+	assert.Nil(t, fi.PeerCAWhitelist)
 	assert.NotEmpty(t, fi)
 	assert.NotEmpty(t, fi.Key)
 	assert.NotEmpty(t, fi.Leaf)
@@ -208,6 +211,24 @@ func TestIdentityConfig_LoadIdentity(t *testing.T) {
 	assert.Equal(t, expectedFI.Leaf, fi.Leaf)
 	assert.Equal(t, expectedFI.CA, fi.CA)
 	assert.Equal(t, expectedFI.ID.Bytes(), fi.ID.Bytes())
+
+	tmp := path.Join(os.TempDir(), "temp-ca-whitelist.pem")
+	w, err := os.Create(tmp)
+	assert.NoError(t, err)
+	defer func() {
+		err := os.RemoveAll(tmp)
+		if err != nil {
+			fmt.Printf("unable to cleanup temp ca whitelist at \"%s\": %s", tmp, err.Error())
+		}
+	}()
+
+	err = peertls.WriteChain(w, fi.CA)
+	assert.NoError(t, err)
+
+	ic.PeerCAWhitelistPath = tmp
+	fi, err = ic.Load()
+	assert.NoError(t, err)
+	assert.NotEmpty(t, fi.PeerCAWhitelist)
 }
 
 func TestNodeID_Difficulty(t *testing.T) {
@@ -225,7 +246,7 @@ func TestVerifyPeer(t *testing.T) {
 		}
 	}
 
-	ca, err := NewCA(context.Background(), 12, 4)
+	ca, err := NewTestCA(context.Background())
 	check(err)
 	fi, err := ca.NewIdentity()
 	check(err)

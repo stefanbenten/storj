@@ -6,42 +6,58 @@ package node
 import (
 	"context"
 
-	"google.golang.org/grpc"
-	"storj.io/storj/pkg/pool"
-	"storj.io/storj/pkg/transport"
-	proto "storj.io/storj/protos/overlay"
+	"storj.io/storj/pkg/dht"
+	"storj.io/storj/pkg/pb"
 )
 
 // Node is the storj definition for a node in the network
 type Node struct {
-	self  proto.Node
-	tc    transport.Client
-	cache pool.Pool
+	dht  dht.DHT
+	self pb.Node
+	pool *ConnectionPool
 }
 
 // Lookup queries nodes looking for a particular node in the network
-func (n *Node) Lookup(ctx context.Context, to proto.Node, find proto.Node) ([]*proto.Node, error) {
-	v, err := n.cache.Get(ctx, to.GetId())
+func (n *Node) Lookup(ctx context.Context, to pb.Node, find pb.Node) ([]*pb.Node, error) {
+	c, err := n.pool.Dial(ctx, &to)
 	if err != nil {
-		return nil, err
+		return nil, NodeClientErr.Wrap(err)
 	}
 
-	var conn *grpc.ClientConn
-	if c, ok := v.(*grpc.ClientConn); ok {
-		conn = c
-	} else {
-		c, err := n.tc.DialNode(ctx, &to)
-		if err != nil {
-			return nil, err
-		}
-		conn = c
+	resp, err := c.Query(ctx, &pb.QueryRequest{Limit: 20, Sender: &n.self, Target: &find, Pingback: true})
+	if err != nil {
+		return nil, NodeClientErr.Wrap(err)
 	}
 
-	c := proto.NewNodesClient(conn)
-	resp, err := c.Query(ctx, &proto.QueryRequest{Sender: &n.self, Target: &find})
+	rt, err := n.dht.GetRoutingTable(ctx)
 	if err != nil {
-		return nil, err
+		return nil, NodeClientErr.Wrap(err)
+	}
+
+	if err := rt.ConnectionSuccess(&to); err != nil {
+		return nil, NodeClientErr.Wrap(err)
+
 	}
 
 	return resp.Response, nil
+}
+
+// Ping attempts to establish a connection with a node to verify it is alive
+func (n *Node) Ping(ctx context.Context, to pb.Node) (bool, error) {
+	c, err := n.pool.Dial(ctx, &to)
+	if err != nil {
+		return false, NodeClientErr.Wrap(err)
+	}
+
+	_, err = c.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// Disconnect closes all connections within the pool
+func (n *Node) Disconnect() error {
+	return n.pool.DisconnectAll()
 }

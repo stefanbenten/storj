@@ -5,53 +5,76 @@ package cmd
 
 import (
 	"fmt"
-	"net/url"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/zeebo/errs"
-	"storj.io/storj/pkg/cfgstruct"
-	"storj.io/storj/pkg/process"
-)
 
-var (
-	rbCfg Config
-	rbCmd = &cobra.Command{
-		Use:   "rb",
-		Short: "Remove an empty bucket",
-		RunE:  deleteBucket,
-	}
+	"storj.io/storj/internal/fpath"
+	"storj.io/storj/pkg/process"
+	"storj.io/storj/pkg/storage/meta"
+	"storj.io/storj/storage"
 )
 
 func init() {
-	RootCmd.AddCommand(rbCmd)
-	cfgstruct.Bind(rbCmd.Flags(), &rbCfg, cfgstruct.ConfDir(defaultConfDir))
-	rbCmd.Flags().String("config", filepath.Join(defaultConfDir, "config.yaml"), "path to configuration")
+	addCmd(&cobra.Command{
+		Use:   "rb",
+		Short: "Remove an empty bucket",
+		RunE:  deleteBucket,
+	}, CLICmd)
 }
 
 func deleteBucket(cmd *cobra.Command, args []string) error {
 	ctx := process.Ctx(cmd)
 
 	if len(args) == 0 {
-		return errs.New("No bucket specified for deletion")
+		return fmt.Errorf("No bucket specified for deletion")
 	}
 
-	so, err := getStorjObjects(ctx, rbCfg)
+	dst, err := fpath.New(args[0])
 	if err != nil {
 		return err
 	}
 
-	u, err := url.Parse(args[0])
+	if dst.IsLocal() {
+		return fmt.Errorf("No bucket specified, use format sj://bucket/")
+	}
+
+	if dst.Path() != "" {
+		return fmt.Errorf("Nested buckets not supported, use format sj://bucket/")
+	}
+
+	bs, err := cfg.BucketStore(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = so.DeleteBucket(ctx, u.Host)
+	_, err = bs.Get(ctx, dst.Bucket())
+	if err != nil {
+		if storage.ErrKeyNotFound.Has(err) {
+			return fmt.Errorf("Bucket not found: %s", dst.Bucket())
+		}
+		return err
+	}
+
+	o, err := bs.GetObjectStore(ctx, dst.Bucket())
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Deleted %s", u.Host)
+	items, _, err := o.List(ctx, "", "", "", true, 1, meta.None)
+	if err != nil {
+		return err
+	}
+
+	if len(items) > 0 {
+		return fmt.Errorf("Bucket not empty: %s", dst.Bucket())
+	}
+
+	err = bs.Delete(ctx, dst.Bucket())
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Bucket %s deleted\n", dst.Bucket())
 
 	return nil
 }

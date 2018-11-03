@@ -21,6 +21,7 @@ import (
 	"storj.io/storj/pkg/storage/objects"
 	segment "storj.io/storj/pkg/storage/segments"
 	streams "storj.io/storj/pkg/storage/streams"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/transport"
 )
 
@@ -29,10 +30,18 @@ import (
 type RSConfig struct {
 	MaxBufferMem     int `help:"maximum buffer memory (in bytes) to be allocated for read buffers" default:"0x400000"`
 	ErasureShareSize int `help:"the size of each new erasure sure in bytes" default:"1024"`
-	MinThreshold     int `help:"the minimum pieces required to recover a segment. k." default:"20"`
-	RepairThreshold  int `help:"the minimum safe pieces before a repair is triggered. m." default:"30"`
-	SuccessThreshold int `help:"the desired total pieces for a segment. o." default:"40"`
-	MaxThreshold     int `help:"the largest amount of pieces to encode to. n." default:"50"`
+	MinThreshold     int `help:"the minimum pieces required to recover a segment. k." default:"29"`
+	RepairThreshold  int `help:"the minimum safe pieces before a repair is triggered. m." default:"35"`
+	SuccessThreshold int `help:"the desired total pieces for a segment. o." default:"80"`
+	MaxThreshold     int `help:"the largest amount of pieces to encode to. n." default:"95"`
+}
+
+// EncryptionConfig is a configuration struct that keeps details about
+// encrypting segments
+type EncryptionConfig struct {
+	EncKey       string `help:"root key for encrypting the data"`
+	EncBlockSize int    `help:"size (in bytes) of encrypted blocks" default:"1024"`
+	EncType      int    `help:"Type of encryption to use (1=AES-GCM, 2=SecretBox)" default:"1"`
 }
 
 // MinioConfig is a configuration struct that keeps details about starting
@@ -40,7 +49,7 @@ type RSConfig struct {
 type MinioConfig struct {
 	AccessKey string `help:"Minio Access Key to use" default:"insecure-dev-access-key"`
 	SecretKey string `help:"Minio Secret Key to use" default:"insecure-dev-secret-key"`
-	MinioDir  string `help:"Minio generic server config path" default:"$CONFDIR/miniogw"`
+	MinioDir  string `help:"Minio generic server config path" default:"$CONFDIR/minio"`
 }
 
 // ClientConfig is a configuration struct for the miniogw that controls how
@@ -62,6 +71,7 @@ type Config struct {
 	MinioConfig
 	ClientConfig
 	RSConfig
+	EncryptionConfig
 }
 
 // Run starts a Minio Gateway given proper config
@@ -94,8 +104,9 @@ func (c Config) Run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+
 	minio.Main([]string{"storj", "gateway", "storj",
-		"--address", c.Address, "--config-dir", c.MinioDir})
+		"--address", c.Address, "--config-dir", c.MinioDir, "--quiet"})
 	return Error.New("unexpected minio exit")
 }
 
@@ -123,7 +134,7 @@ func (c Config) GetBucketStore(ctx context.Context, identity *provider.FullIdent
 		return nil, err
 	}
 
-	pdb, err := pdbclient.NewClient(identity, c.PointerDBAddr, []byte(c.APIKey))
+	pdb, err := pdbclient.NewClient(identity, c.PointerDBAddr, c.APIKey)
 	if err != nil {
 		return nil, err
 	}
@@ -133,20 +144,26 @@ func (c Config) GetBucketStore(ctx context.Context, identity *provider.FullIdent
 	if err != nil {
 		return nil, err
 	}
-	rs, err := eestream.NewRedundancyStrategy(
-		eestream.NewRSScheme(fc, c.ErasureShareSize),
-		c.RepairThreshold, c.SuccessThreshold)
+	rs, err := eestream.NewRedundancyStrategy(eestream.NewRSScheme(fc, c.ErasureShareSize), c.RepairThreshold, c.SuccessThreshold)
 	if err != nil {
 		return nil, err
 	}
 
 	segments := segment.NewSegmentStore(oc, ec, pdb, rs, c.MaxInlineSize)
 
-	// segment size 64MB
-	stream, err := streams.NewStreamStore(segments, c.SegmentSize)
+	if c.ErasureShareSize*c.MinThreshold%c.EncBlockSize != 0 {
+		err = Error.New("EncryptionBlockSize must be a multiple of ErasureShareSize * RS MinThreshold")
+		return nil, err
+	}
+
+	key := new(storj.Key)
+	copy(key[:], c.EncKey)
+
+	stream, err := streams.NewStreamStore(segments, c.SegmentSize, key, c.EncBlockSize, storj.Cipher(c.EncType))
 	if err != nil {
 		return nil, err
 	}
+
 	obj := objects.NewStore(stream)
 
 	return buckets.NewStore(obj), nil

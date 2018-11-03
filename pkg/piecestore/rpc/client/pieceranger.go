@@ -11,45 +11,41 @@ import (
 
 	"github.com/zeebo/errs"
 
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/ranger"
-	pb "storj.io/storj/protos/piecestore"
 )
 
 // Error is the error class for pieceRanger
 var Error = errs.Class("pieceRanger error")
 
 type pieceRanger struct {
-	c      *Client
-	id     PieceID
-	size   int64
-	stream pb.PieceStoreRoutes_RetrieveClient
-	pba    *pb.PayerBandwidthAllocation
+	c             *Client
+	id            PieceID
+	size          int64
+	stream        pb.PieceStoreRoutes_RetrieveClient
+	pba           *pb.PayerBandwidthAllocation
+	authorization *pb.SignedMessage
 }
 
-// PieceRanger PieceRanger returns a RangeCloser from a PieceID.
-func PieceRanger(ctx context.Context, c *Client, stream pb.PieceStoreRoutes_RetrieveClient, id PieceID, pba *pb.PayerBandwidthAllocation) (ranger.RangeCloser, error) {
+// PieceRanger PieceRanger returns a Ranger from a PieceID.
+func PieceRanger(ctx context.Context, c *Client, stream pb.PieceStoreRoutes_RetrieveClient, id PieceID, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (ranger.Ranger, error) {
 	piece, err := c.Meta(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return &pieceRanger{c: c, id: id, size: piece.Size, stream: stream, pba: pba}, nil
+	return &pieceRanger{c: c, id: id, size: piece.Size, stream: stream, pba: pba, authorization: authorization}, nil
 }
 
 // PieceRangerSize creates a PieceRanger with known size.
 // Use it if you know the piece size. This will safe the extra request for
 // retrieving the piece size from the piece storage.
-func PieceRangerSize(c *Client, stream pb.PieceStoreRoutes_RetrieveClient, id PieceID, size int64, pba *pb.PayerBandwidthAllocation) ranger.RangeCloser {
-	return &pieceRanger{c: c, id: id, size: size, stream: stream, pba: pba}
+func PieceRangerSize(c *Client, stream pb.PieceStoreRoutes_RetrieveClient, id PieceID, size int64, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) ranger.Ranger {
+	return &pieceRanger{c: c, id: id, size: size, stream: stream, pba: pba, authorization: authorization}
 }
 
 // Size implements Ranger.Size
 func (r *pieceRanger) Size() int64 {
 	return r.size
-}
-
-// Size implements Ranger.Size
-func (r *pieceRanger) Close() error {
-	return r.c.Close()
 }
 
 // Range implements Ranger.Range
@@ -68,9 +64,9 @@ func (r *pieceRanger) Range(ctx context.Context, offset, length int64) (io.ReadC
 	}
 
 	// send piece data
-	if err := r.stream.Send(&pb.PieceRetrieval{PieceData: &pb.PieceRetrieval_PieceData{Id: r.id.String(), Size: length, Offset: offset}}); err != nil {
+	if err := r.stream.Send(&pb.PieceRetrieval{PieceData: &pb.PieceRetrieval_PieceData{Id: r.id.String(), Size: length, Offset: offset}, Authorization: r.authorization}); err != nil {
 		return nil, err
 	}
 
-	return NewStreamReader(r.c, r.stream, r.pba), nil
+	return NewStreamReader(r.c, r.stream, r.pba, r.size), nil
 }

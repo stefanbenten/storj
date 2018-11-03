@@ -1,257 +1,412 @@
 // Copyright (C) 2018 Storj Labs, Inc.
 // See LICENSE for copying information.
+// See LICENSE for copying information.
 
 package kademlia
 
 import (
 	"context"
-	"math/rand"
+	"io/ioutil"
+	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
-	"time"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 
 	"storj.io/storj/pkg/dht"
-
-	"github.com/stretchr/testify/assert"
-	"storj.io/storj/protos/overlay"
+	"storj.io/storj/pkg/node"
+	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/provider"
 )
 
-const (
-	testNetSize = 20
-)
-
-func bootstrapTestNetwork(t *testing.T, ip, port string) ([]dht.DHT, overlay.Node) {
-	bid, err := newID()
-	assert.NoError(t, err)
-
-	bnid := NodeID(bid)
-	dhts := []dht.DHT{}
-
-	p, err := strconv.Atoi(port)
-	pm := strconv.Itoa(p)
-	assert.NoError(t, err)
-	intro, err := GetIntroNode(bnid.String(), ip, pm)
-	assert.NoError(t, err)
-
-	boot, err := NewKademlia(&bnid, []overlay.Node{*intro}, ip, pm)
-	assert.NoError(t, err)
-
-	//added bootnode to dhts so it could be closed in defer as well
-	dhts = append(dhts, boot)
-
-	rt, err := boot.GetRoutingTable(context.Background())
-	assert.NoError(t, err)
-	bootNode := rt.Local()
-
-	err = boot.ListenAndServe()
-	assert.NoError(t, err)
-	p++
-
-	err = boot.Bootstrap(context.Background())
-	assert.NoError(t, err)
-	for i := 0; i < testNetSize; i++ {
-		gg := strconv.Itoa(p)
-
-		nid, err := newID()
-		assert.NoError(t, err)
-		id := NodeID(nid)
-
-		dht, err := NewKademlia(&id, []overlay.Node{bootNode}, ip, gg)
-		assert.NoError(t, err)
-
-		p++
-		dhts = append(dhts, dht)
-		err = dht.ListenAndServe()
-		assert.NoError(t, err)
-		err = dht.Bootstrap(context.Background())
-		assert.NoError(t, err)
-
-	}
-
-	return dhts, bootNode
+// helper function to generate new node identities with
+// correct difficulty and concurrency
+func newTestIdentity() (*provider.FullIdentity, error) {
+	fid, err := node.NewFullIdentity(context.Background(), 12, 4)
+	return fid, err
 }
 
-func newTestKademlia(t *testing.T, ip, port string, b overlay.Node) *Kademlia {
-	i, err := newID()
-	assert.NoError(t, err)
-	id := NodeID(i)
-	n := []overlay.Node{b}
-
-	kad, err := NewKademlia(&id, n, ip, port)
-	assert.NoError(t, err)
-	return kad
-}
-
-func TestBootstrap(t *testing.T) {
-	t.Skip()
-	dhts, bootNode := bootstrapTestNetwork(t, "127.0.0.1", "3000")
-
-	defer func(d []dht.DHT) {
-		for _, v := range d {
-			v.Disconnect()
-		}
-	}(dhts)
-
+func TestNewKademlia(t *testing.T) {
+	rootdir, cleanup := mktempdir(t, "kademlia")
+	defer cleanup()
 	cases := []struct {
-		k *Kademlia
+		id          dht.NodeID
+		bn          []pb.Node
+		addr        string
+		expectedErr error
 	}{
 		{
-			k: newTestKademlia(t, "127.0.0.1", "2999", bootNode),
+			id: func() *node.ID {
+				id, err := newTestIdentity()
+				assert.NoError(t, err)
+				n := node.ID(id.ID)
+				return &n
+			}(),
+			bn:   []pb.Node{pb.Node{Id: "foo"}},
+			addr: "127.0.0.1:8080",
+		},
+		{
+			id: func() *node.ID {
+				id, err := newTestIdentity()
+				assert.NoError(t, err)
+				n := node.ID(id.ID)
+				return &n
+			}(),
+			bn:   []pb.Node{pb.Node{Id: "foo"}},
+			addr: "127.0.0.1:8080",
+		},
+	}
+
+	for i, v := range cases {
+		dir := filepath.Join(rootdir, strconv.Itoa(i))
+
+		ca, err := provider.NewTestCA(context.Background())
+		assert.NoError(t, err)
+		identity, err := ca.NewIdentity()
+		assert.NoError(t, err)
+
+		kad, err := NewKademlia(v.id, v.bn, v.addr, identity, dir, defaultAlpha)
+		assert.NoError(t, err)
+		assert.Equal(t, v.expectedErr, err)
+		assert.Equal(t, kad.bootstrapNodes, v.bn)
+		assert.NotNil(t, kad.nodeClient)
+		assert.NotNil(t, kad.routingTable)
+		assert.NoError(t, kad.Disconnect())
+	}
+
+}
+
+func TestPeerDiscovery(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	addr := lis.Addr().String()
+
+	assert.NoError(t, err)
+
+	srv, mns := newTestServer([]*pb.Node{&pb.Node{Id: "foo"}})
+	go func() { assert.NoError(t, srv.Serve(lis)) }()
+	defer srv.Stop()
+
+	dir, cleanup := mktempdir(t, "kademlia")
+	defer cleanup()
+	k := func() *Kademlia {
+		// make new identity
+		fid, err := newTestIdentity()
+		assert.NoError(t, err)
+		fid2, err := newTestIdentity()
+		assert.NoError(t, err)
+
+		// create two new unique identities
+		id := fid.ID
+		id2 := fid2.ID
+		assert.NotEqual(t, id, id2)
+
+		kid := dht.NodeID(fid.ID)
+		k, err := NewKademlia(kid, []pb.Node{pb.Node{Id: id2.String(), Address: &pb.NodeAddress{Address: lis.Addr().String()}}}, lis.Addr().String(), fid, dir, defaultAlpha)
+		assert.NoError(t, err)
+		return k
+	}()
+
+	defer func() {
+		assert.NoError(t, k.Disconnect())
+	}()
+
+	cases := []struct {
+		target      dht.NodeID
+		opts        discoveryOptions
+		expected    *pb.Node
+		expectedErr error
+	}{
+		{target: func() *node.ID {
+			fid, err := newTestIdentity()
+			id := dht.NodeID(fid.ID)
+			nid := node.ID(fid.ID)
+			assert.NoError(t, err)
+			mns.returnValue = []*pb.Node{&pb.Node{Id: id.String(), Address: &pb.NodeAddress{Address: addr}}}
+			return &nid
+		}(),
+			opts:        discoveryOptions{concurrency: 3, bootstrap: true, retries: 1},
+			expected:    &pb.Node{},
+			expectedErr: nil,
+		},
+		{target: func() *node.ID {
+			id, err := newTestIdentity()
+			assert.NoError(t, err)
+			n := node.ID(id.ID)
+			return &n
+		}(),
+			opts:        discoveryOptions{concurrency: 3, bootstrap: true, retries: 1},
+			expected:    nil,
+			expectedErr: nil,
 		},
 	}
 
 	for _, v := range cases {
-		defer v.k.Disconnect()
-		err := v.k.ListenAndServe()
-		assert.NoError(t, err)
-		err = v.k.Bootstrap(context.Background())
-		assert.NoError(t, err)
-		ctx := context.Background()
+		err := k.lookup(context.Background(), v.target, v.opts)
+		assert.Equal(t, v.expectedErr, err)
+	}
+}
 
-		rt, err := dhts[0].GetRoutingTable(context.Background())
-		assert.NoError(t, err)
+func TestBootstrap(t *testing.T) {
+	bn, s, clean := testNode(t, []pb.Node{})
+	defer clean()
+	defer s.Stop()
 
-		localID := rt.Local().Id
-		n := NodeID(localID)
-		node, err := v.k.FindNode(ctx, &n)
-		assert.NoError(t, err)
-		assert.NotEmpty(t, node)
-		assert.Equal(t, localID, node.Id)
-		v.k.dht.Disconnect()
+	n1, s1, clean1 := testNode(t, []pb.Node{bn.routingTable.self})
+	defer clean1()
+	defer s1.Stop()
+
+	err := n1.Bootstrap(context.Background())
+	assert.NoError(t, err)
+
+	n2, s2, clean2 := testNode(t, []pb.Node{bn.routingTable.self})
+	defer clean2()
+	defer s2.Stop()
+
+	err = n2.Bootstrap(context.Background())
+	assert.NoError(t, err)
+
+	nodeIDs, err := n2.routingTable.nodeBucketDB.List(nil, 0)
+	assert.NoError(t, err)
+	assert.Len(t, nodeIDs, 3)
+}
+
+func testNode(t *testing.T, bn []pb.Node) (*Kademlia, *grpc.Server, func()) {
+	// new address
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	// new config
+	// new identity
+	fid, err := newTestIdentity()
+	id := dht.NodeID(fid.ID)
+	assert.NoError(t, err)
+	// new kademlia
+	dir, cleanup := mktempdir(t, "kademlia")
+
+	k, err := NewKademlia(id, bn, lis.Addr().String(), fid, dir, defaultAlpha)
+	assert.NoError(t, err)
+	s := node.NewServer(k)
+	// new ident opts
+	identOpt, err := fid.ServerOption()
+	assert.NoError(t, err)
+
+	grpcServer := grpc.NewServer(identOpt)
+
+	pb.RegisterNodesServer(grpcServer, s)
+	go func() { assert.NoError(t, grpcServer.Serve(lis)) }()
+
+	return k, grpcServer, func() {
+		defer cleanup()
+		assert.NoError(t, k.Disconnect())
 	}
 
 }
 
 func TestGetNodes(t *testing.T) {
-	t.Skip()
-	dhts, bootNode := bootstrapTestNetwork(t, "127.0.0.1", "6001")
-	defer func(d []dht.DHT) {
-		for _, v := range d {
-			err := v.Disconnect()
-			assert.NoError(t, err)
-		}
-	}(dhts)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
 
-	cases := []struct {
-		k            *Kademlia
-		limit        int
-		expectedErr  error
-		restrictions []overlay.Restriction
-	}{
-		{
-			k:           newTestKademlia(t, "127.0.0.1", "6000", bootNode),
-			limit:       10,
-			expectedErr: nil,
-		},
-	}
-
-	for _, v := range cases {
-		defer v.k.Disconnect()
-		ctx := context.Background()
-		err := v.k.ListenAndServe()
-		assert.Equal(t, v.expectedErr, err)
-		time.Sleep(time.Second)
-		err = v.k.Bootstrap(ctx)
-		assert.NoError(t, err)
-
-		rt, err := v.k.GetRoutingTable(context.Background())
-
-		assert.NoError(t, err)
-		start := rt.Local().Id
-
-		nodes, err := v.k.GetNodes(ctx, start, v.limit, v.restrictions...)
-		assert.Equal(t, v.expectedErr, err)
-		assert.Len(t, nodes, v.limit)
-		v.k.dht.Disconnect()
-	}
-
-}
-
-func TestFindNode(t *testing.T) {
-	t.Skip()
-	dhts, bootNode := bootstrapTestNetwork(t, "127.0.0.1", "5001")
-	defer func(d []dht.DHT) {
-		for _, v := range d {
-			err := v.Disconnect()
-			assert.NoError(t, err)
-		}
-	}(dhts)
-
-	cases := []struct {
-		k           *Kademlia
-		expectedErr error
-	}{
-		{
-			k:           newTestKademlia(t, "127.0.0.1", "6000", bootNode),
-			expectedErr: nil,
-		},
-	}
-
-	for _, v := range cases {
-		defer v.k.Disconnect()
-		ctx := context.Background()
-		go v.k.ListenAndServe()
-		time.Sleep(time.Second)
-		err := v.k.Bootstrap(ctx)
-		assert.NoError(t, err)
-
-		rt, err := dhts[rand.Intn(testNetSize)].GetRoutingTable(context.Background())
-		assert.NoError(t, err)
-
-		id := NodeID(rt.Local().Id)
-		node, err := v.k.FindNode(ctx, &id)
-		assert.Equal(t, v.expectedErr, err)
-		assert.NotZero(t, node)
-		assert.Equal(t, node.Id, id.String())
-	}
-
-}
-
-func TestPing(t *testing.T) {
-	t.Skip()
-	dhts, bootNode := bootstrapTestNetwork(t, "127.0.0.1", "4001")
-	defer func(d []dht.DHT) {
-		for _, v := range d {
-			v.Disconnect()
-		}
-	}(dhts)
-
-	r := dhts[rand.Intn(testNetSize)]
-	rt, err := r.GetRoutingTable(context.Background())
-	addr := rt.Local().Address
 	assert.NoError(t, err)
 
+	srv, _ := newTestServer([]*pb.Node{&pb.Node{Id: "foo"}})
+	go func() { assert.NoError(t, srv.Serve(lis)) }()
+	defer srv.Stop()
+
+	// make new identity
+	fid, err := newTestIdentity()
+	assert.NoError(t, err)
+	fid2, err := newTestIdentity()
+	assert.NoError(t, err)
+	fid.ID = "AAAAA"
+	fid2.ID = "BBBBB"
+	// create two new unique identities
+	id := node.ID(fid.ID)
+	id2 := node.ID(fid2.ID)
+	assert.NotEqual(t, id, id2)
+	kid := dht.NodeID(fid.ID)
+
+	dir, cleanup := mktempdir(t, "kademlia")
+	defer cleanup()
+	k, err := NewKademlia(kid, []pb.Node{pb.Node{Id: id2.String(), Address: &pb.NodeAddress{Address: lis.Addr().String()}}}, lis.Addr().String(), fid, dir, defaultAlpha)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, k.Disconnect())
+	}()
+
+	// add nodes
+	ids := []string{"AAAAA", "BBBBB", "CCCCC", "DDDDD"}
+	bw := []int64{1, 2, 3, 4}
+	disk := []int64{4, 3, 2, 1}
+	nodes := []*pb.Node{}
+	for i, v := range ids {
+		n := &pb.Node{
+			Id: v,
+			Restrictions: &pb.NodeRestrictions{
+				FreeBandwidth: bw[i],
+				FreeDisk:      disk[i],
+			},
+		}
+		nodes = append(nodes, n)
+		err = k.routingTable.ConnectionSuccess(n)
+		assert.NoError(t, err)
+	}
+
 	cases := []struct {
-		k           *Kademlia
-		input       overlay.Node
-		expectedErr error
+		testID       string
+		start        string
+		limit        int
+		restrictions []pb.Restriction
+		expected     []*pb.Node
 	}{
-		{
-			k: newTestKademlia(t, "127.0.0.1", "6000", bootNode),
-			input: overlay.Node{
-				Id: rt.Local().Id,
-				Address: &overlay.NodeAddress{
-					Transport: defaultTransport,
-					Address:   addr.Address,
+		{testID: "one",
+			start: "BBBBB",
+			limit: 2,
+			restrictions: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_GT,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(2),
 				},
 			},
-			expectedErr: nil,
+			expected: nodes[2:],
+		},
+		{testID: "two",
+			start: "AAAAA",
+			limit: 3,
+			restrictions: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_GT,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(2),
+				},
+				pb.Restriction{
+					Operator: pb.Restriction_LT,
+					Operand:  pb.Restriction_freeDisk,
+					Value:    int64(2),
+				},
+			},
+			expected: nodes[3:],
+		},
+		{testID: "three",
+			start:        "AAAAA",
+			limit:        4,
+			restrictions: []pb.Restriction{},
+			expected:     nodes,
 		},
 	}
-
-	for _, v := range cases {
-		defer v.k.Disconnect()
-		ctx := context.Background()
-		go v.k.ListenAndServe()
-		time.Sleep(time.Second)
-		err := v.k.Bootstrap(ctx)
-		assert.NoError(t, err)
-
-		node, err := v.k.Ping(ctx, v.input)
-		assert.Equal(t, v.expectedErr, err)
-		assert.NotEmpty(t, node)
-		assert.Equal(t, v.input, node)
-		v.k.dht.Disconnect()
+	for _, c := range cases {
+		t.Run(c.testID, func(t *testing.T) {
+			ns, err := k.GetNodes(context.Background(), c.start, c.limit, c.restrictions...)
+			assert.NoError(t, err)
+			assert.Equal(t, len(c.expected), len(ns))
+			for i, n := range ns {
+				assert.True(t, proto.Equal(c.expected[i], n))
+			}
+		})
 	}
+}
 
+func TestMeetsRestrictions(t *testing.T) {
+	cases := []struct {
+		testID string
+		r      []pb.Restriction
+		n      pb.Node
+		expect bool
+	}{
+		{testID: "pass one",
+			r: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_EQ,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(1),
+				},
+			},
+			n: pb.Node{
+				Restrictions: &pb.NodeRestrictions{
+					FreeBandwidth: int64(1),
+				},
+			},
+			expect: true,
+		},
+		{testID: "pass multiple",
+			r: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_LTE,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(2),
+				},
+				pb.Restriction{
+					Operator: pb.Restriction_GTE,
+					Operand:  pb.Restriction_freeDisk,
+					Value:    int64(2),
+				},
+			},
+			n: pb.Node{
+				Restrictions: &pb.NodeRestrictions{
+					FreeBandwidth: int64(1),
+					FreeDisk:      int64(3),
+				},
+			},
+			expect: true,
+		},
+		{testID: "fail one",
+			r: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_LT,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(2),
+				},
+				pb.Restriction{
+					Operator: pb.Restriction_GT,
+					Operand:  pb.Restriction_freeDisk,
+					Value:    int64(2),
+				},
+			},
+			n: pb.Node{
+				Restrictions: &pb.NodeRestrictions{
+					FreeBandwidth: int64(2),
+					FreeDisk:      int64(3),
+				},
+			},
+			expect: false,
+		},
+		{testID: "fail multiple",
+			r: []pb.Restriction{
+				pb.Restriction{
+					Operator: pb.Restriction_LT,
+					Operand:  pb.Restriction_freeBandwidth,
+					Value:    int64(2),
+				},
+				pb.Restriction{
+					Operator: pb.Restriction_GT,
+					Operand:  pb.Restriction_freeDisk,
+					Value:    int64(2),
+				},
+			},
+			n: pb.Node{
+				Restrictions: &pb.NodeRestrictions{
+					FreeBandwidth: int64(2),
+					FreeDisk:      int64(2),
+				},
+			},
+			expect: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.testID, func(t *testing.T) {
+			result := meetsRestrictions(c.r, c.n)
+			assert.Equal(t, c.expect, result)
+		})
+	}
+}
+
+func mktempdir(t *testing.T, dir string) (string, func()) {
+	rootdir, err := ioutil.TempDir("", dir)
+	assert.NoError(t, err)
+	cleanup := func() {
+		assert.NoError(t, os.RemoveAll(rootdir))
+	}
+	return rootdir, cleanup
 }

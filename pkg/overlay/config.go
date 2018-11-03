@@ -14,9 +14,9 @@ import (
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
 	"storj.io/storj/pkg/kademlia"
+	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/utils"
-	proto "storj.io/storj/protos/overlay"
 )
 
 var (
@@ -31,6 +31,14 @@ type Config struct {
 	DatabaseURL     string        `help:"the database connection string to use" default:"bolt://$CONFDIR/overlay.db"`
 	RefreshInterval time.Duration `help:"the interval at which the cache refreshes itself in seconds" default:"30s"`
 }
+
+// CtxKey used for assigning cache
+type CtxKey int
+
+const (
+	ctxKeyOverlay CtxKey = iota
+	ctxKeyOverlayServer
+)
 
 // Run implements the provider.Responsibility interface. Run assumes a
 // Kademlia responsibility has been started before this one.
@@ -95,16 +103,34 @@ func (c Config) Run(ctx context.Context, server *provider.Provider) (
 		}
 	}()
 
-	proto.RegisterOverlayServer(server.GRPC(), &Server{
+	srv := &Server{
 		dht:   kad,
 		cache: cache,
 
 		// TODO(jt): do something else
 		logger:  zap.L(),
 		metrics: monkit.Default,
-	})
-
+	}
+	pb.RegisterOverlayServer(server.GRPC(), srv)
+	ctx = context.WithValue(ctx, ctxKeyOverlay, cache)
+	ctx = context.WithValue(ctx, ctxKeyOverlayServer, srv)
 	return server.Run(ctx)
+}
+
+// LoadFromContext gives access to the cache from the context, or returns nil
+func LoadFromContext(ctx context.Context) *Cache {
+	if v, ok := ctx.Value(ctxKeyOverlay).(*Cache); ok {
+		return v
+	}
+	return nil
+}
+
+// LoadServerFromContext gives access to the overlay server from the context, or returns nil
+func LoadServerFromContext(ctx context.Context) *Server {
+	if v, ok := ctx.Value(ctxKeyOverlayServer).(*Server); ok {
+		return v
+	}
+	return nil
 }
 
 // GetUserPassword extracts password from scheme://user:password@hostname

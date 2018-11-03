@@ -11,19 +11,24 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
-	"storj.io/storj/pointerdb/auth"
+	"storj.io/storj/pkg/pointerdb/auth"
 )
 
 // example of how the auth package is working.
 // see readme in auth/ for how to run
 func main() {
-
 	pflag.String("key", "", "this is your API KEY")
-	viper.BindPFlag("key", pflag.Lookup("key"))
+	err := viper.BindPFlag("key", pflag.Lookup("key"))
+	if err != nil {
+		fmt.Println(err)
+	}
 	pflag.Parse()
 
 	viper.SetEnvPrefix("API")
-	os.Setenv("API_KEY", "12345")
+	err = os.Setenv("API_KEY", "12345")
+	if err != nil {
+		fmt.Println(err)
+	}
 	viper.AutomaticEnv()
 
 	httpRequestHeaders := InitializeHeaders()

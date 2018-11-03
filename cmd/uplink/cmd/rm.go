@@ -5,53 +5,53 @@ package cmd
 
 import (
 	"fmt"
-	"net/url"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/zeebo/errs"
-	"storj.io/storj/pkg/cfgstruct"
+
+	"storj.io/storj/internal/fpath"
 	"storj.io/storj/pkg/process"
 )
 
-var (
-	rmCfg Config
-	rmCmd = &cobra.Command{
-		Use:   "rm",
-		Short: "A brief description of your command",
-		RunE:  delete,
-	}
-)
-
 func init() {
-	RootCmd.AddCommand(rmCmd)
-	cfgstruct.Bind(rmCmd.Flags(), &rmCfg, cfgstruct.ConfDir(defaultConfDir))
-	rmCmd.Flags().String("config", filepath.Join(defaultConfDir, "config.yaml"), "path to configuration")
+	addCmd(&cobra.Command{
+		Use:   "rm",
+		Short: "Delete an object",
+		RunE:  delete,
+	}, CLICmd)
 }
 
 func delete(cmd *cobra.Command, args []string) error {
 	ctx := process.Ctx(cmd)
 
 	if len(args) == 0 {
-		return errs.New("No object specified for deletion")
+		return fmt.Errorf("No object specified for deletion")
 	}
 
-	so, err := getStorjObjects(ctx, rmCfg)
+	dst, err := fpath.New(args[0])
 	if err != nil {
 		return err
 	}
 
-	u, err := url.Parse(args[0])
+	if dst.IsLocal() {
+		return fmt.Errorf("No bucket specified, use format sj://bucket/")
+	}
+
+	bs, err := cfg.BucketStore(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = so.DeleteObject(ctx, u.Host, u.Path)
+	o, err := bs.GetObjectStore(ctx, dst.Bucket())
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Deleted %s from %s", u.Path, u.Host)
+	err = o.Delete(ctx, dst.Path())
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Deleted %s\n", dst)
 
 	return nil
 }

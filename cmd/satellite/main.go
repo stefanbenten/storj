@@ -9,12 +9,16 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+
+	"storj.io/storj/pkg/auth/grpcauth"
 	"storj.io/storj/pkg/cfgstruct"
 	"storj.io/storj/pkg/kademlia"
 	"storj.io/storj/pkg/overlay"
+	mockOverlay "storj.io/storj/pkg/overlay/mocks"
 	"storj.io/storj/pkg/pointerdb"
 	"storj.io/storj/pkg/process"
 	"storj.io/storj/pkg/provider"
+	"storj.io/storj/pkg/statdb"
 )
 
 var (
@@ -34,11 +38,17 @@ var (
 	}
 
 	runCfg struct {
-		Identity    provider.IdentityConfig
-		Kademlia    kademlia.Config
-		PointerDB   pointerdb.Config
+		Identity  provider.IdentityConfig
+		Kademlia  kademlia.Config
+		PointerDB pointerdb.Config
+		// Checker     checker.Config
+		// Repairer    repairer.Config
 		Overlay     overlay.Config
-		MockOverlay overlay.MockConfig
+		MockOverlay mockOverlay.Config
+		StatDB      statdb.Config
+		// RepairQueue   queue.Config
+		// RepairChecker checker.Config
+		// Repairer      repairer.Config
 	}
 	setupCfg struct {
 		BasePath  string `default:"$CONFDIR" help:"base path for setup"`
@@ -62,8 +72,14 @@ func cmdRun(cmd *cobra.Command, args []string) (err error) {
 	if runCfg.MockOverlay.Nodes != "" {
 		o = runCfg.MockOverlay
 	}
-	return runCfg.Identity.Run(process.Ctx(cmd),
-		runCfg.Kademlia, runCfg.PointerDB, o)
+	return runCfg.Identity.Run(
+		process.Ctx(cmd),
+		grpcauth.NewAPIKeyInterceptor(),
+		runCfg.Kademlia,
+		runCfg.PointerDB,
+		o,
+		runCfg.StatDB,
+	)
 }
 
 func cmdSetup(cmd *cobra.Command, args []string) (err error) {
@@ -76,6 +92,12 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 	if !setupCfg.Overwrite && err == nil {
 		fmt.Println("An satellite configuration already exists. Rerun with --overwrite")
 		return nil
+	} else if setupCfg.Overwrite && err == nil {
+		fmt.Println("overwriting existing satellite config")
+		err = os.RemoveAll(setupCfg.BasePath)
+		if err != nil {
+			return err
+		}
 	}
 
 	err = os.MkdirAll(setupCfg.BasePath, 0700)

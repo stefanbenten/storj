@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+
 	"storj.io/storj/pkg/cfgstruct"
 	"storj.io/storj/pkg/provider"
 )
@@ -44,5 +45,8 @@ func main() {
 		fmt.Println(err)
 	}
 	fmt.Println(conn.GetState())
-	conn.Close()
+	err = conn.Close()
+	if err != nil {
+		fmt.Println(err)
+	}
 }

@@ -4,13 +4,11 @@
 package main
 
 import (
-	"crypto/rand"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 
-	base58 "github.com/jbenet/go-base58"
 	"github.com/spf13/cobra"
 
 	"storj.io/storj/pkg/cfgstruct"
@@ -29,7 +27,10 @@ type Config struct {
 	BasePath            string `help:"base path for captain planet storage" default:"$CONFDIR"`
 	ListenHost          string `help:"the host for providers to listen on" default:"127.0.0.1"`
 	StartingPort        int    `help:"all providers will listen on ports consecutively starting with this one" default:"7777"`
+	APIKey              string `default:"abc123" help:"the api key to use for the satellite"`
+	EncKey              string `default:"highlydistributedridiculouslyresilient" help:"your root encryption key"`
 	Overwrite           bool   `help:"whether to overwrite pre-existing configuration files" default:"false"`
+	GenerateMinioCerts  bool   `default:"false" help:"generate sample TLS certs for Minio GW"`
 }
 
 var (
@@ -58,6 +59,12 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 	if !setupCfg.Overwrite && err == nil {
 		fmt.Println("A captplanet configuration already exists. Rerun with --overwrite")
 		return nil
+	} else if setupCfg.Overwrite && err == nil {
+		fmt.Println("overwriting existing captplanet config")
+		err = os.RemoveAll(setupCfg.BasePath)
+		if err != nil {
+			return err
+		}
 	}
 
 	hcPath := filepath.Join(setupCfg.BasePath, "satellite")
@@ -109,16 +116,25 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	startingPort := setupCfg.StartingPort
-
-	apiKey, err := newAPIKey()
-	if err != nil {
-		return err
+	if setupCfg.GenerateMinioCerts {
+		minioCertsPath := filepath.Join(uplinkPath, "minio", "certs")
+		if err := os.MkdirAll(minioCertsPath, 0744); err != nil {
+			return err
+		}
+		if err := os.Link(setupCfg.ULIdentity.CertPath, filepath.Join(minioCertsPath, "public.crt")); err != nil {
+			return err
+		}
+		if err := os.Link(setupCfg.ULIdentity.KeyPath, filepath.Join(minioCertsPath, "private.key")); err != nil {
+			return err
+		}
 	}
 
+	startingPort := setupCfg.StartingPort
+
 	overrides := map[string]interface{}{
-		"satellite.identity.cert-path": setupCfg.HCIdentity.CertPath,
-		"satellite.identity.key-path":  setupCfg.HCIdentity.KeyPath,
+		"satellite.repairer.queue-address": "redis://127.0.0.1:6378?db=1&password=abc123",
+		"satellite.identity.cert-path":     setupCfg.HCIdentity.CertPath,
+		"satellite.identity.key-path":      setupCfg.HCIdentity.KeyPath,
 		"satellite.identity.address": joinHostPort(
 			setupCfg.ListenHost, startingPort+1),
 		"satellite.kademlia.todo-listen-addr": joinHostPort(
@@ -139,13 +155,14 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 			setupCfg.ListenHost, startingPort+1),
 		"uplink.minio-dir": filepath.Join(
 			setupCfg.BasePath, "uplink", "minio"),
-		"uplink.api-key":          apiKey,
-		"pointer-db.auth.api-key": apiKey,
+		"uplink.enc-key":          setupCfg.EncKey,
+		"uplink.api-key":          setupCfg.APIKey,
+		"pointer-db.auth.api-key": setupCfg.APIKey,
 	}
 
 	for i := 0; i < len(runCfg.StorageNodes); i++ {
 		storagenodePath := filepath.Join(setupCfg.BasePath, fmt.Sprintf("f%d", i))
-		storagenode := fmt.Sprintf("storage-nodes.%02d.", i)
+		storagenode := fmt.Sprintf("storage-nodes.%03d.", i)
 		overrides[storagenode+"identity.cert-path"] = filepath.Join(
 			storagenodePath, "identity.cert")
 		overrides[storagenode+"identity.key-path"] = filepath.Join(
@@ -165,13 +182,4 @@ func cmdSetup(cmd *cobra.Command, args []string) (err error) {
 
 func joinHostPort(host string, port int) string {
 	return net.JoinHostPort(host, fmt.Sprint(port))
-}
-
-func newAPIKey() (string, error) {
-	var buf [20]byte
-	_, err := rand.Read(buf[:])
-	if err != nil {
-		return "", err
-	}
-	return base58.Encode(buf[:]), nil
 }

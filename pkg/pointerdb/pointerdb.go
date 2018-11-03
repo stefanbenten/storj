@@ -5,18 +5,24 @@ package pointerdb
 
 import (
 	"context"
+	"encoding/base64"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
+	"storj.io/storj/pkg/auth"
+	"storj.io/storj/pkg/overlay"
+	"storj.io/storj/pkg/pb"
+	pointerdbAuth "storj.io/storj/pkg/pointerdb/auth"
+	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/storage/meta"
-	"storj.io/storj/pointerdb/auth"
-	pb "storj.io/storj/protos/pointerdb"
 	"storj.io/storj/storage"
 )
 
@@ -27,37 +33,59 @@ var (
 
 // Server implements the network state RPC service
 type Server struct {
-	DB     storage.KeyValueStore
-	logger *zap.Logger
-	config Config
+	DB       storage.KeyValueStore
+	logger   *zap.Logger
+	config   Config
+	cache    *overlay.Cache
+	identity *provider.FullIdentity
 }
 
 // NewServer creates instance of Server
-func NewServer(db storage.KeyValueStore, logger *zap.Logger, c Config) *Server {
+func NewServer(db storage.KeyValueStore, cache *overlay.Cache, logger *zap.Logger, c Config, identity *provider.FullIdentity) *Server {
 	return &Server{
-		DB:     db,
-		logger: logger,
-		config: c,
+		DB:       db,
+		logger:   logger,
+		config:   c,
+		cache:    cache,
+		identity: identity,
 	}
 }
 
-func (s *Server) validateAuth(APIKey []byte) error {
-	if !auth.ValidateAPIKey(string(APIKey)) {
+func (s *Server) validateAuth(ctx context.Context) error {
+	APIKey, ok := auth.GetAPIKey(ctx)
+	if !ok || !pointerdbAuth.ValidateAPIKey(string(APIKey)) {
 		s.logger.Error("unauthorized request: ", zap.Error(status.Errorf(codes.Unauthenticated, "Invalid API credential")))
 		return status.Errorf(codes.Unauthenticated, "Invalid API credential")
 	}
 	return nil
 }
 
+func (s *Server) appendSignature(ctx context.Context) error {
+	signature, err := auth.GenerateSignature(s.identity.ID.Bytes(), s.identity)
+	if err != nil {
+		return err
+	}
+
+	if signature == nil {
+		return nil
+	}
+
+	base64 := base64.StdEncoding
+	encodedSignature := base64.EncodeToString(signature)
+	return grpc.SetHeader(ctx, metadata.Pairs("signature", encodedSignature))
+}
+
 func (s *Server) validateSegment(req *pb.PutRequest) error {
-	min := s.config.MinInlineSegmentSize
+	min := s.config.MinRemoteSegmentSize
+	remote := req.GetPointer().Remote
+	remoteSize := req.GetPointer().GetSize()
+
+	if remote != nil && remoteSize < int64(min) {
+		return segmentError.New("remote segment size %d less than minimum allowed %d", remoteSize, min)
+	}
+
 	max := s.config.MaxInlineSegmentSize
 	inlineSize := len(req.GetPointer().InlineSegment)
-	remote := req.GetPointer().Remote
-
-	if remote != nil && req.GetPointer().GetSize() < min {
-		return segmentError.New("inline segment size %d less than minimum allowed %d", inlineSize, min)
-	}
 
 	if inlineSize > max {
 		return segmentError.New("inline segment size %d greater than maximum allowed %d", inlineSize, max)
@@ -69,14 +97,13 @@ func (s *Server) validateSegment(req *pb.PutRequest) error {
 // Put formats and hands off a key/value (path/pointer) to be saved to boltdb
 func (s *Server) Put(ctx context.Context, req *pb.PutRequest) (resp *pb.PutResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
-	s.logger.Debug("entering pointerdb put")
 
 	err = s.validateSegment(req)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
-	if err = s.validateAuth(req.GetAPIKey()); err != nil {
+	if err = s.validateAuth(ctx); err != nil {
 		return nil, err
 	}
 
@@ -96,7 +123,6 @@ func (s *Server) Put(ctx context.Context, req *pb.PutRequest) (resp *pb.PutRespo
 		s.logger.Error("err putting pointer", zap.Error(err))
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
-	s.logger.Debug("put to the db: " + req.GetPath())
 
 	return &pb.PutResponse{}, nil
 }
@@ -104,9 +130,14 @@ func (s *Server) Put(ctx context.Context, req *pb.PutRequest) (resp *pb.PutRespo
 // Get formats and hands off a file path to get from boltdb
 func (s *Server) Get(ctx context.Context, req *pb.GetRequest) (resp *pb.GetResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
+
 	s.logger.Debug("entering pointerdb get")
 
-	if err = s.validateAuth(req.GetAPIKey()); err != nil {
+	if err = s.validateAuth(ctx); err != nil {
+		return nil, err
+	}
+
+	if err = s.appendSignature(ctx); err != nil {
 		return nil, err
 	}
 
@@ -119,17 +150,53 @@ func (s *Server) Get(ctx context.Context, req *pb.GetRequest) (resp *pb.GetRespo
 		return nil, status.Errorf(codes.Internal, err.Error())
 	}
 
-	return &pb.GetResponse{
-		Pointer: pointerBytes,
-	}, nil
+	pointer := &pb.Pointer{}
+	err = proto.Unmarshal(pointerBytes, pointer)
+	if err != nil {
+		s.logger.Error("Error unmarshaling pointer")
+		return nil, err
+	}
+
+	pba, err := s.getPayerBandwidthAllocation(ctx)
+	if err != nil {
+		s.logger.Error("err getting payer bandwidth allocation", zap.Error(err))
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+
+	nodes := []*pb.Node{}
+
+	var r = &pb.GetResponse{
+		Pointer: pointer,
+		Nodes:   nil,
+		Pba:     pba,
+	}
+
+	if !s.config.Overlay || pointer.Remote == nil {
+		return r, nil
+	}
+
+	for _, piece := range pointer.Remote.RemotePieces {
+		node, err := s.cache.Get(ctx, piece.NodeId)
+		if err != nil {
+			s.logger.Error("Error getting node from cache")
+		}
+		nodes = append(nodes, node)
+	}
+
+	r = &pb.GetResponse{
+		Pointer: pointer,
+		Nodes:   nodes,
+		Pba:     pba,
+	}
+
+	return r, nil
 }
 
 // List returns all Path keys in the Pointers bucket
 func (s *Server) List(ctx context.Context, req *pb.ListRequest) (resp *pb.ListResponse, err error) {
 	defer mon.Task()(&ctx)(&err)
-	s.logger.Debug("entering pointerdb list")
 
-	if err = s.validateAuth(req.APIKey); err != nil {
+	if err = s.validateAuth(ctx); err != nil {
 		return nil, err
 	}
 
@@ -155,7 +222,7 @@ func (s *Server) List(ctx context.Context, req *pb.ListRequest) (resp *pb.ListRe
 
 	var items []*pb.ListResponse_Item
 	for _, rawItem := range rawItems {
-		items = append(items, s.createListItem(prefix, rawItem, req.MetaFlags))
+		items = append(items, s.createListItem(rawItem, req.MetaFlags))
 	}
 
 	return &pb.ListResponse{Items: items, More: more}, nil
@@ -163,9 +230,9 @@ func (s *Server) List(ctx context.Context, req *pb.ListRequest) (resp *pb.ListRe
 
 // createListItem creates a new list item with the given path. It also adds
 // the metadata according to the given metaFlags.
-func (s *Server) createListItem(prefix storage.Key, rawItem storage.ListItem, metaFlags uint32) *pb.ListResponse_Item {
+func (s *Server) createListItem(rawItem storage.ListItem, metaFlags uint32) *pb.ListResponse_Item {
 	item := &pb.ListResponse_Item{
-		Path:     append(prefix, rawItem.Key...).String(),
+		Path:     rawItem.Key.String(),
 		IsPrefix: rawItem.IsPrefix,
 	}
 	if item.IsPrefix {
@@ -216,7 +283,7 @@ func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (resp *pb.De
 	defer mon.Task()(&ctx)(&err)
 	s.logger.Debug("entering pointerdb delete")
 
-	if err = s.validateAuth(req.GetAPIKey()); err != nil {
+	if err = s.validateAuth(ctx); err != nil {
 		return nil, err
 	}
 
@@ -227,4 +294,40 @@ func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (resp *pb.De
 	}
 	s.logger.Debug("deleted pointer at path: " + req.GetPath())
 	return &pb.DeleteResponse{}, nil
+}
+
+// Iterate iterates over items based on IterateRequest
+func (s *Server) Iterate(ctx context.Context, req *pb.IterateRequest, f func(it storage.Iterator) error) error {
+	opts := storage.IterateOptions{
+		Prefix:  storage.Key(req.Prefix),
+		First:   storage.Key(req.First),
+		Recurse: req.Recurse,
+		Reverse: req.Reverse,
+	}
+	return s.DB.Iterate(opts, f)
+}
+
+func (s *Server) getPayerBandwidthAllocation(ctx context.Context) (*pb.PayerBandwidthAllocation, error) {
+	payer := s.identity.ID.Bytes()
+
+	// TODO(michal) should be replaced with renter id when available
+	peerIdentity, err := provider.PeerIdentityFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pbad := &pb.PayerBandwidthAllocation_Data{
+		SatelliteId: payer,
+		UplinkId:    peerIdentity.ID.Bytes(),
+		// TODO: Action: pb.PayerBandwidthAllocation_GET, // Action should be a GET or a PUT
+	}
+
+	data, err := proto.Marshal(pbad)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := auth.GenerateSignature(data, s.identity)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.PayerBandwidthAllocation{Signature: signature, Data: data}, nil
 }

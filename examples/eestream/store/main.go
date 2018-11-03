@@ -15,13 +15,15 @@ import (
 	"github.com/vivint/infectious"
 
 	"storj.io/storj/pkg/eestream"
+	"storj.io/storj/pkg/encryption"
+	"storj.io/storj/pkg/storj"
 )
 
 var (
-	pieceBlockSize = flag.Int("piece_block_size", 4*1024, "block size of pieces")
-	key            = flag.String("key", "a key", "the secret key")
-	rsk            = flag.Int("required", 20, "rs required")
-	rsn            = flag.Int("total", 40, "rs total")
+	erasureShareSize = flag.Int("erasure_share_size", 4*1024, "block size of pieces")
+	key              = flag.String("key", "a key", "the secret key")
+	rsk              = flag.Int("required", 20, "rs required")
+	rsn              = flag.Int("total", 40, "rs total")
 )
 
 func main() {
@@ -47,20 +49,19 @@ func Main() error {
 	if err != nil {
 		return err
 	}
-	es := eestream.NewRSScheme(fc, *pieceBlockSize)
+	es := eestream.NewRSScheme(fc, *erasureShareSize)
 	rs, err := eestream.NewRedundancyStrategy(es, 0, 0)
 	if err != nil {
 		return err
 	}
-	encKey := sha256.Sum256([]byte(*key))
-	var firstNonce [12]byte
-	encrypter, err := eestream.NewAESGCMEncrypter(
-		&encKey, &firstNonce, es.DecodedBlockSize())
+	encKey := storj.Key(sha256.Sum256([]byte(*key)))
+	var firstNonce storj.Nonce
+	encrypter, err := encryption.NewEncrypter(storj.AESGCM, &encKey, &firstNonce, es.StripeSize())
 	if err != nil {
 		return err
 	}
 	readers, err := eestream.EncodeReader(context.Background(),
-		eestream.TransformReader(eestream.PadReader(os.Stdin,
+		encryption.TransformReader(eestream.PadReader(os.Stdin,
 			encrypter.InBlockSize()), encrypter, 0), rs, 4*1024*1024)
 	if err != nil {
 		return err
@@ -68,13 +69,15 @@ func Main() error {
 	errs := make(chan error, len(readers))
 	for i := range readers {
 		go func(i int) {
-			fh, err := os.Create(
-				filepath.Join(flag.Arg(0), fmt.Sprintf("%d.piece", i)))
+			pieceFile := filepath.Join(flag.Arg(0), fmt.Sprintf("%d.piece", i))
+			fh, err := os.Create(pieceFile)
 			if err != nil {
 				errs <- err
 				return
 			}
-			defer fh.Close()
+
+			defer printError(fh.Close)
+
 			_, err = io.Copy(fh, readers[i])
 			errs <- err
 		}(i)
@@ -86,4 +89,11 @@ func Main() error {
 		}
 	}
 	return nil
+}
+
+func printError(fn func() error) {
+	err := fn()
+	if err != nil {
+		fmt.Println(err)
+	}
 }
