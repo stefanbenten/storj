@@ -1,38 +1,27 @@
 // Copyright (C) 2018 Storj Labs, Inc.
 // See LICENSE for copying information.
 
-package overlay
+package overlay_test
 
 import (
-	"context"
-	"net"
 	"testing"
+	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
-	"github.com/zeebo/errs"
-	"google.golang.org/grpc"
+	"github.com/stretchr/testify/require"
 
-	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/node"
+	"storj.io/storj/internal/testcontext"
+	"storj.io/storj/internal/testidentity"
+	"storj.io/storj/internal/testplanet"
+	"storj.io/storj/pkg/overlay"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/provider"
-	"storj.io/storj/storage"
-	"storj.io/storj/storage/redis/redisserver"
+	"storj.io/storj/pkg/storj"
 )
 
-type mockNodeID struct {
-}
+func TestNewClient(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
 
-func (m mockNodeID) String() string {
-	return "foobar"
-}
-
-func (m mockNodeID) Bytes() []byte {
-	return []byte("foobar")
-}
-
-func TestNewOverlayClient(t *testing.T) {
 	cases := []struct {
 		address string
 	}{
@@ -42,320 +31,257 @@ func TestNewOverlayClient(t *testing.T) {
 	}
 
 	for _, v := range cases {
-		ca, err := provider.NewTestCA(ctx)
+		ca, err := testidentity.NewTestCA(ctx)
 		assert.NoError(t, err)
 		identity, err := ca.NewIdentity()
 		assert.NoError(t, err)
 
-		oc, err := NewOverlayClient(identity, v.address)
+		oc, err := overlay.NewClient(identity, v.address)
 		assert.NoError(t, err)
 
 		assert.NotNil(t, oc)
-		assert.NotEmpty(t, oc.client)
-
 	}
 }
 
 func TestChoose(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	planet, err := testplanet.New(t, 1, 4, 1)
+	require.NoError(t, err)
+
+	planet.Start(ctx)
+	// we wait a second for all the nodes to complete bootstrapping off the satellite
+	time.Sleep(2 * time.Second)
+	defer ctx.Check(planet.Shutdown)
+
+	oc, err := planet.Uplinks[0].DialOverlay(planet.Satellites[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n1 := &pb.Node{Id: storj.NodeID{1}, Type: pb.NodeType_STORAGE}
+	n2 := &pb.Node{Id: storj.NodeID{2}, Type: pb.NodeType_STORAGE}
+	n3 := &pb.Node{Id: storj.NodeID{3}, Type: pb.NodeType_STORAGE}
+	n4 := &pb.Node{Id: storj.NodeID{4}, Type: pb.NodeType_STORAGE}
+	n5 := &pb.Node{Id: storj.NodeID{5}, Type: pb.NodeType_STORAGE}
+	n6 := &pb.Node{Id: storj.NodeID{6}, Type: pb.NodeType_STORAGE}
+	n7 := &pb.Node{Id: storj.NodeID{7}, Type: pb.NodeType_STORAGE}
+	n8 := &pb.Node{Id: storj.NodeID{8}, Type: pb.NodeType_STORAGE}
+
+	id1 := storj.NodeID{1}
+	id2 := storj.NodeID{2}
+	id3 := storj.NodeID{3}
+	id4 := storj.NodeID{4}
+
 	cases := []struct {
-		limit    int
-		space    int64
-		allNodes []*pb.Node
-		excluded []dht.NodeID
+		limit        int
+		space        int64
+		bandwidth    int64
+		uptime       float64
+		uptimeCount  int64
+		auditSuccess float64
+		auditCount   int64
+		allNodes     []*pb.Node
+		excluded     storj.NodeIDList
 	}{
 		{
-			limit: 4,
-			space: 0,
-			allNodes: func() []*pb.Node {
-				n1 := &pb.Node{Id: "n1"}
-				n2 := &pb.Node{Id: "n2"}
-				n3 := &pb.Node{Id: "n3"}
-				n4 := &pb.Node{Id: "n4"}
-				n5 := &pb.Node{Id: "n5"}
-				n6 := &pb.Node{Id: "n6"}
-				n7 := &pb.Node{Id: "n7"}
-				n8 := &pb.Node{Id: "n8"}
-				return []*pb.Node{n1, n2, n3, n4, n5, n6, n7, n8}
-			}(),
-			excluded: func() []dht.NodeID {
-				id1 := node.IDFromString("n1")
-				id2 := node.IDFromString("n2")
-				id3 := node.IDFromString("n3")
-				id4 := node.IDFromString("n4")
-				return []dht.NodeID{id1, id2, id3, id4}
-			}(),
+			limit:        4,
+			space:        0,
+			bandwidth:    0,
+			uptime:       0,
+			uptimeCount:  0,
+			auditSuccess: 0,
+			auditCount:   0,
+			allNodes:     []*pb.Node{n1, n2, n3, n4, n5, n6, n7, n8},
+			excluded:     storj.NodeIDList{id1, id2, id3, id4},
 		},
 	}
 
 	for _, v := range cases {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		newNodes, err := oc.Choose(ctx, overlay.Options{
+			Amount:       v.limit,
+			Space:        v.space,
+			Uptime:       v.uptime,
+			UptimeCount:  v.uptimeCount,
+			AuditSuccess: v.auditSuccess,
+			AuditCount:   v.auditCount,
+			Excluded:     v.excluded,
+		})
 		assert.NoError(t, err)
 
-		var listItems []storage.ListItem
-		for _, n := range v.allNodes {
-			data, err := proto.Marshal(n)
-			assert.NoError(t, err)
-			listItems = append(listItems, storage.ListItem{
-				Key:   storage.Key(n.Id),
-				Value: data,
-			})
+		excludedNodes := make(map[storj.NodeID]bool)
+		for _, e := range v.excluded {
+			excludedNodes[e] = true
 		}
+		assert.Len(t, newNodes, v.limit)
+		for _, n := range newNodes {
+			assert.NotContains(t, excludedNodes, n.Id)
+			assert.True(t, n.GetRestrictions().GetFreeDisk() >= v.space)
+			assert.True(t, n.GetRestrictions().GetFreeBandwidth() >= v.bandwidth)
+			assert.True(t, n.GetReputation().GetUptimeRatio() >= v.uptime)
+			assert.True(t, n.GetReputation().GetUptimeCount() >= v.uptimeCount)
+			assert.True(t, n.GetReputation().GetAuditSuccessRatio() >= v.auditSuccess)
+			assert.True(t, n.GetReputation().GetAuditCount() >= v.auditCount)
 
-		ca, err := provider.NewTestCA(ctx)
-		assert.NoError(t, err)
-		identity, err := ca.NewIdentity()
-		assert.NoError(t, err)
-
-		srv := NewMockServer(listItems, func() grpc.ServerOption {
-			opt, err := identity.ServerOption()
-			assert.NoError(t, err)
-			return opt
-		}())
-
-		go func() { assert.NoError(t, srv.Serve(lis)) }()
-		defer srv.Stop()
-
-		oc, err := NewOverlayClient(identity, lis.Addr().String())
-		assert.NoError(t, err)
-
-		assert.NotNil(t, oc)
-		assert.NotEmpty(t, oc.client)
-
-		newNodes, err := oc.Choose(ctx, Options{Amount: v.limit, Space: v.space, Excluded: v.excluded})
-		assert.NoError(t, err)
-		for _, new := range newNodes {
-			for _, ex := range v.excluded {
-				assert.NotEqual(t, ex.String(), new.Id)
-			}
 		}
 	}
 }
 
 func TestLookup(t *testing.T) {
-	cases := []struct {
-		nodeID        dht.NodeID
-		expectedCalls int
-	}{
-		{
-			nodeID:        mockNodeID{},
-			expectedCalls: 1,
-		},
-	}
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
 
-	for _, v := range cases {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		assert.NoError(t, err)
+	planet, err := testplanet.New(t, 1, 4, 1)
+	require.NoError(t, err)
 
-		srv, mock, err := newTestServer(ctx)
-		assert.NoError(t, err)
-		go func() { assert.NoError(t, srv.Serve(lis)) }()
-		defer srv.Stop()
+	planet.Start(ctx)
+	// we wait a second for all the nodes to complete bootstrapping off the satellite
+	time.Sleep(2 * time.Second)
+	defer ctx.Check(planet.Shutdown)
 
-		ca, err := provider.NewTestCA(ctx)
-		assert.NoError(t, err)
-		identity, err := ca.NewIdentity()
-		assert.NoError(t, err)
-
-		oc, err := NewOverlayClient(identity, lis.Addr().String())
-		assert.NoError(t, err)
-
-		assert.NotNil(t, oc)
-		assert.NotEmpty(t, oc.client)
-
-		_, err = oc.Lookup(ctx, v.nodeID)
-		assert.NoError(t, err)
-		assert.Equal(t, mock.lookupCalled, v.expectedCalls)
-	}
-
-}
-func TestBulkLookup(t *testing.T) {
-	cases := []struct {
-		nodeIDs       []dht.NodeID
-		expectedCalls int
-	}{
-		{
-			nodeIDs:       []dht.NodeID{mockNodeID{}, mockNodeID{}, mockNodeID{}},
-			expectedCalls: 1,
-		},
-	}
-	for _, v := range cases {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		assert.NoError(t, err)
-
-		srv, mock, err := newTestServer(ctx)
-		assert.NoError(t, err)
-		go func() { assert.NoError(t, srv.Serve(lis)) }()
-		defer srv.Stop()
-
-		ca, err := provider.NewTestCA(ctx)
-		assert.NoError(t, err)
-		identity, err := ca.NewIdentity()
-		assert.NoError(t, err)
-
-		oc, err := NewOverlayClient(identity, lis.Addr().String())
-		assert.NoError(t, err)
-
-		assert.NotNil(t, oc)
-		assert.NotEmpty(t, oc.client)
-
-		_, err = oc.BulkLookup(ctx, v.nodeIDs)
-		assert.NoError(t, err)
-		assert.Equal(t, mock.bulkLookupCalled, v.expectedCalls)
-	}
-}
-func TestBulkLookupV2(t *testing.T) {
-	redisAddr, cleanup, err := redisserver.Start()
+	oc, err := planet.Uplinks[0].DialOverlay(planet.Satellites[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanup()
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	assert.NoError(t, err)
-
-	srv, s, err := newServer(ctx, redisAddr)
-
-	assert.NoError(t, err)
-	go func() { assert.NoError(t, srv.Serve(lis)) }()
-	defer srv.Stop()
-
-	ca, err := provider.NewTestCA(ctx)
-	assert.NoError(t, err)
-	identity, err := ca.NewIdentity()
-	assert.NoError(t, err)
-
-	oc, err := NewOverlayClient(identity, lis.Addr().String())
-	assert.NoError(t, err)
-
-	assert.NotNil(t, oc)
-	assert.NotEmpty(t, oc.client)
-	n1 := &pb.Node{Id: "n1"}
-	n2 := &pb.Node{Id: "n2"}
-	n3 := &pb.Node{Id: "n3"}
-	nodes := []*pb.Node{n1, n2, n3}
-	for _, n := range nodes {
-		assert.NoError(t, s.cache.Put(n.Id, *n))
-	}
+	nid1 := planet.StorageNodes[0].ID()
 
 	cases := []struct {
-		testID    string
-		nodeIDs   []dht.NodeID
-		responses []*pb.Node
-		errors    *errs.Class
+		nodeID    storj.NodeID
+		expectErr bool
 	}{
-		{testID: "empty id",
-			nodeIDs:   []dht.NodeID{},
-			responses: nil,
-			errors:    &ClientError,
+		{
+			nodeID:    nid1,
+			expectErr: false,
 		},
-		{testID: "valid ids",
-			nodeIDs: func() []dht.NodeID {
-				id1 := node.IDFromString("n1")
-				id2 := node.IDFromString("n2")
-				id3 := node.IDFromString("n3")
-				return []dht.NodeID{id1, id2, id3}
-			}(),
-			responses: nodes,
-			errors:    nil,
-		},
-		{testID: "missing ids",
-			nodeIDs: func() []dht.NodeID {
-				id1 := node.IDFromString("n4")
-				id2 := node.IDFromString("n5")
-				return []dht.NodeID{id1, id2}
-			}(),
-			responses: []*pb.Node{nil, nil},
-			errors:    nil,
-		},
-		{testID: "random order and nil",
-			nodeIDs: func() []dht.NodeID {
-				id1 := node.IDFromString("n1")
-				id2 := node.IDFromString("n2")
-				id3 := node.IDFromString("n3")
-				id4 := node.IDFromString("n4")
-				return []dht.NodeID{id2, id1, id3, id4}
-			}(),
-			responses: func() []*pb.Node {
-				return []*pb.Node{nodes[1], nodes[0], nodes[2], nil}
-			}(),
-			errors: nil,
+		{
+			nodeID:    storj.NodeID{1},
+			expectErr: true,
 		},
 	}
-	for _, c := range cases {
-		t.Run(c.testID, func(t *testing.T) {
-			ns, err := oc.BulkLookup(ctx, c.nodeIDs)
-			assertErrClass(t, c.errors, err)
-			assert.Equal(t, c.responses, ns)
-		})
-	}
-}
 
-func newServer(ctx context.Context, redisAddr string) (*grpc.Server, *Server, error) {
-	ca, err := provider.NewTestCA(ctx)
-	if err != nil {
-		return nil, nil, err
+	for _, v := range cases {
+		n, err := oc.Lookup(ctx, v.nodeID)
+		if v.expectErr {
+			assert.Error(t, err)
+		} else {
+			assert.NoError(t, err)
+			assert.Equal(t, n.Id.String(), v.nodeID.String())
+		}
 	}
-	identity, err := ca.NewIdentity()
-	if err != nil {
-		return nil, nil, err
-	}
-	identOpt, err := identity.ServerOption()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	grpcServer := grpc.NewServer(identOpt)
-	cache, err := NewRedisOverlayCache(redisAddr, "", 1, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	s := &Server{cache: cache}
-
-	pb.RegisterOverlayServer(grpcServer, s)
-
-	return grpcServer, s, nil
-}
-
-func newTestServer(ctx context.Context) (*grpc.Server, *mockOverlayServer, error) {
-	ca, err := provider.NewTestCA(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	identity, err := ca.NewIdentity()
-	if err != nil {
-		return nil, nil, err
-	}
-	identOpt, err := identity.ServerOption()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	grpcServer := grpc.NewServer(identOpt)
-	mo := &mockOverlayServer{lookupCalled: 0, FindStorageNodesCalled: 0}
-
-	pb.RegisterOverlayServer(grpcServer, mo)
-
-	return grpcServer, mo, nil
 
 }
 
-type mockOverlayServer struct {
-	lookupCalled           int
-	bulkLookupCalled       int
-	FindStorageNodesCalled int
+func TestBulkLookup(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	planet, err := testplanet.New(t, 1, 4, 1)
+	require.NoError(t, err)
+
+	planet.Start(ctx)
+	// we wait a second for all the nodes to complete bootstrapping off the satellite
+	time.Sleep(2 * time.Second)
+	defer ctx.Check(planet.Shutdown)
+
+	oc, err := planet.Uplinks[0].DialOverlay(planet.Satellites[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nid1 := planet.StorageNodes[0].ID()
+	nid2 := planet.StorageNodes[1].ID()
+	nid3 := planet.StorageNodes[2].ID()
+
+	cases := []struct {
+		nodeIDs       storj.NodeIDList
+		expectedCalls int
+	}{
+		{
+			nodeIDs:       storj.NodeIDList{nid1, nid2, nid3},
+			expectedCalls: 1,
+		},
+	}
+	for _, v := range cases {
+		resNodes, err := oc.BulkLookup(ctx, v.nodeIDs)
+		assert.NoError(t, err)
+		for i, n := range resNodes {
+			assert.Equal(t, n.Id, v.nodeIDs[i])
+		}
+		assert.Equal(t, len(resNodes), len(v.nodeIDs))
+	}
 }
 
-func (o *mockOverlayServer) Lookup(ctx context.Context, req *pb.LookupRequest) (*pb.LookupResponse, error) {
-	o.lookupCalled++
-	return &pb.LookupResponse{}, nil
-}
+func TestBulkLookupV2(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
 
-func (o *mockOverlayServer) FindStorageNodes(ctx context.Context, req *pb.FindStorageNodesRequest) (*pb.FindStorageNodesResponse, error) {
-	o.FindStorageNodesCalled++
-	return &pb.FindStorageNodesResponse{}, nil
-}
+	planet, err := testplanet.New(t, 1, 4, 1)
+	require.NoError(t, err)
 
-func (o *mockOverlayServer) BulkLookup(ctx context.Context, reqs *pb.LookupRequests) (*pb.LookupResponses, error) {
-	o.bulkLookupCalled++
-	return &pb.LookupResponses{}, nil
+	planet.Start(ctx)
+	// we wait a second for all the nodes to complete bootstrapping off the satellite
+	time.Sleep(2 * time.Second)
+	defer ctx.Check(planet.Shutdown)
+
+	oc, err := planet.Uplinks[0].DialOverlay(planet.Satellites[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache := planet.Satellites[0].Overlay
+
+	nid1 := storj.NodeID{1}
+	nid2 := storj.NodeID{2}
+	nid3 := storj.NodeID{3}
+	nid4 := storj.NodeID{4}
+	nid5 := storj.NodeID{5}
+
+	n1 := &pb.Node{Id: storj.NodeID{1}}
+	n2 := &pb.Node{Id: storj.NodeID{2}}
+	n3 := &pb.Node{Id: storj.NodeID{3}}
+
+	nodes := []*pb.Node{n1, n2, n3}
+	for _, n := range nodes {
+		assert.NoError(t, cache.Put(ctx, n.Id, *n))
+	}
+
+	{ // empty id
+		_, err := oc.BulkLookup(ctx, storj.NodeIDList{})
+		assert.Error(t, err)
+	}
+
+	{ // valid ids
+		idList := storj.NodeIDList{nid1, nid2, nid3}
+		ns, err := oc.BulkLookup(ctx, idList)
+		assert.NoError(t, err)
+
+		for i, n := range ns {
+			assert.Equal(t, n.Id, idList[i])
+		}
+	}
+
+	{ // missing ids
+		idList := storj.NodeIDList{nid4, nid5}
+		ns, err := oc.BulkLookup(ctx, idList)
+		assert.NoError(t, err)
+
+		assert.Equal(t, []*pb.Node{nil, nil}, ns)
+	}
+
+	{ // different order and missing
+		idList := storj.NodeIDList{nid3, nid4, nid1, nid2, nid5}
+		ns, err := oc.BulkLookup(ctx, idList)
+		assert.NoError(t, err)
+
+		expectedNodes := []*pb.Node{n3, nil, n1, n2, nil}
+		for i, n := range ns {
+			if n == nil {
+				assert.Nil(t, expectedNodes[i])
+			} else {
+				assert.Equal(t, n.Id, expectedNodes[i].Id)
+			}
+		}
+	}
 }

@@ -11,73 +11,69 @@ import (
 
 	"storj.io/storj/internal/sync2"
 	"storj.io/storj/pkg/datarepair/queue"
-	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/storj"
+	"storj.io/storj/storage"
 )
 
-// Repairer is the interface for the data repair queue
-type Repairer interface {
-	Repair(ctx context.Context, seg *pb.InjuredSegment) error
-	Run(ctx context.Context) error
+// SegmentRepairer is a repairer for segments
+type SegmentRepairer interface {
+	Repair(ctx context.Context, path storj.Path, lostPieces []int32) (err error)
 }
 
-// repairer holds important values for data repair
-type repairer struct {
-	queue   queue.RepairQueue
-	limiter *sync2.Limiter
-	ticker  *time.Ticker
+// repairService contains the information needed to run the repair service
+type repairService struct {
+	queue    queue.RepairQueue
+	repairer SegmentRepairer
+	limiter  *sync2.Limiter
+	ticker   *time.Ticker
 }
 
-func newRepairer(queue queue.RepairQueue, interval time.Duration, concurrency int) *repairer {
-	return &repairer{
-		queue:   queue,
-		limiter: sync2.NewLimiter(concurrency),
-		ticker:  time.NewTicker(interval),
+func newService(queue queue.RepairQueue, repairer SegmentRepairer, interval time.Duration, concurrency int) *repairService {
+	return &repairService{
+		queue:    queue,
+		repairer: repairer,
+		limiter:  sync2.NewLimiter(concurrency),
+		ticker:   time.NewTicker(interval),
 	}
 }
 
 // Run runs the repairer service
-func (r *repairer) Run(ctx context.Context) (err error) {
+func (service *repairService) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	// wait for all repairs to complete
-	defer r.limiter.Wait()
+	defer service.limiter.Wait()
 
 	for {
-		err := r.process(ctx)
+		err := service.process(ctx)
 		if err != nil {
 			zap.L().Error("process", zap.Error(err))
 		}
 
 		select {
-		case <-r.ticker.C: // wait for the next interval to happen
-		case <-ctx.Done(): // or the repairer is canceled via context
+		case <-service.ticker.C: // wait for the next interval to happen
+		case <-ctx.Done(): // or the repairer service is canceled via context
 			return ctx.Err()
 		}
 	}
 }
 
-// process picks an item from repair queue and spawns a repairer
-func (r *repairer) process(ctx context.Context) error {
-	seg, err := r.queue.Dequeue()
+// process picks an item from repair queue and spawns a repair worker
+func (service *repairService) process(ctx context.Context) error {
+	seg, err := service.queue.Dequeue(ctx)
 	if err != nil {
-		// TODO: only log when err != ErrQueueEmpty
+		if storage.ErrEmptyQueue.Has(err) {
+			return nil
+		}
 		return err
 	}
 
-	r.limiter.Go(ctx, func() {
-		err := r.Repair(ctx, &seg)
+	service.limiter.Go(ctx, func() {
+		err := service.repairer.Repair(ctx, seg.GetPath(), seg.GetLostPieces())
 		if err != nil {
 			zap.L().Error("Repair failed", zap.Error(err))
 		}
 	})
 
 	return nil
-}
-
-// Repair starts repair of the segment
-func (r *repairer) Repair(ctx context.Context, seg *pb.InjuredSegment) (err error) {
-	defer mon.Task()(&ctx)(&err)
-	// TODO:
-	zap.L().Debug("Repairing", zap.Any("segment", seg))
-	return err
 }

@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Storj Labs, Inc.
+// Copyright (C) 2019 Storj Labs, Inc.
 // See LICENSE for copying information.
 
 package statdb
@@ -8,25 +8,28 @@ import (
 
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/provider"
-	pb "storj.io/storj/pkg/statdb/proto"
+	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/server"
 )
 
-// Config is a configuration struct that is everything you need to start a
-// StatDB responsibility
-type Config struct {
-	DatabaseURL    string `help:"the database connection string to use" default:"$CONFDIR/stats.db"`
-	DatabaseDriver string `help:"the database driver to use" default:"sqlite3"`
-}
+// Config represents a StatDB service
+type Config struct{}
 
-// Run implements the provider.Responsibility interface
-func (c Config) Run(ctx context.Context, server *provider.Provider) error {
-	ns, err := NewServer(c.DatabaseDriver, c.DatabaseURL, zap.L())
-	if err != nil {
-		return err
+// Run implements server.Service
+func (Config) Run(ctx context.Context, server *server.Server) (err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	sdb, ok := ctx.Value("masterdb").(interface {
+		StatDB() DB
+	})
+	if !ok {
+		return Error.New("unable to get master db instance")
 	}
 
-	pb.RegisterStatDBServer(server.GRPC(), ns)
+	zap.S().Warn("Once the Peer refactor is done, the statdb inspector needs to be registered on a " +
+		"gRPC server that only listens on localhost")
+	// TODO: register on a private rpc server
+	pb.RegisterStatDBInspectorServer(server.GRPC(), NewInspector(sdb.StatDB()))
 
 	return server.Run(ctx)
 }

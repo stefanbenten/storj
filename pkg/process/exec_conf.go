@@ -7,8 +7,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,8 +22,6 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
-
-	"storj.io/storj/pkg/telemetry"
 )
 
 // ExecuteWithConfig runs a Cobra command with the provided default config
@@ -48,34 +50,74 @@ var (
 	contexts   = map[*cobra.Command]context.Context{}
 )
 
-// SaveConfig will save all flags with default values to outfilewith specific
-// values specified in 'overrides' overridden.
+// SaveConfig will save only the user-specific flags with default values to
+// outfile with specific values specified in 'overrides' overridden.
 func SaveConfig(flagset *pflag.FlagSet, outfile string, overrides map[string]interface{}) error {
+	return saveConfig(flagset, outfile, overrides, false)
+}
 
-	vip := viper.New()
-	err := vip.BindPFlags(pflag.CommandLine)
+// SaveConfigWithAllDefaults will save all flags with default values to outfile
+// with specific values specified in 'overrides' overridden.
+func SaveConfigWithAllDefaults(flagset *pflag.FlagSet, outfile string, overrides map[string]interface{}) error {
+	return saveConfig(flagset, outfile, overrides, true)
+}
+
+func saveConfig(flagset *pflag.FlagSet, outfile string, overrides map[string]interface{}, saveAllDefaults bool) error {
+	// we previously used Viper here, but switched to a custom serializer to allow comments
+	//todo:  switch back to Viper once go-yaml v3 is released and its supports writing comments?
+	flagset.AddFlagSet(pflag.CommandLine)
+	//sort keys
+	var keys []string
+	flagset.VisitAll(func(f *pflag.Flag) { keys = append(keys, f.Name) })
+	sort.Strings(keys)
+	//serialize
+	var sb strings.Builder
+	w := &sb
+	for _, k := range keys {
+		f := flagset.Lookup(k)
+		if readBoolAnnotation(f, "setup") {
+			continue
+		}
+
+		var overriddenValue interface{}
+		var overrideExist bool
+		if overrides != nil {
+			overriddenValue, overrideExist = overrides[k]
+		}
+
+		if !saveAllDefaults && !readBoolAnnotation(f, "user") && !f.Changed && !overrideExist {
+			continue
+		}
+
+		value := f.Value.String()
+		if overriddenValue != nil {
+			value = fmt.Sprintf("%v", overriddenValue)
+		}
+		if f.Usage != "" {
+			fmt.Fprintf(w, "# %s\n", f.Usage)
+		}
+		fmt.Fprintf(w, "%s: ", k)
+		switch f.Value.Type() {
+		case "string":
+			// save ourselves 250+ lines of code and just double quote strings
+			fmt.Fprintf(w, "%q\n", value)
+		default:
+			//assume that everything else doesn't have fancy control characters
+			fmt.Fprintf(w, "%s\n", value)
+		}
+	}
+
+	err := ioutil.WriteFile(outfile, []byte(sb.String()), os.FileMode(0644))
 	if err != nil {
 		return err
 	}
-	flagset.VisitAll(func(f *pflag.Flag) {
-		// stop processing if we hit an error on a BindPFlag call
-		if err != nil {
-			return
-		}
-		if f.Name == "config" {
-			return
-		}
-		err = vip.BindPFlag(f.Name, f)
-	})
-	if err != nil {
-		return err
-	}
+	fmt.Println("Configuration saved to:", outfile)
+	return nil
+}
 
-	for key, val := range overrides {
-		vip.Set(key, val)
-	}
-
-	return vip.WriteConfigAs(os.ExpandEnv(outfile))
+func readBoolAnnotation(flag *pflag.Flag, key string) bool {
+	annotation := flag.Annotations[key]
+	return len(annotation) > 0 && annotation[0] == "true"
 }
 
 // Ctx returns the appropriate context.Context for ExecuteWithConfig commands
@@ -90,7 +132,8 @@ func Ctx(cmd *cobra.Command) context.Context {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-c
+		sig := <-c
+		log.Printf("Got a signal from the OS: %q", sig)
 		signal.Stop(c)
 		cancel()
 	}()
@@ -121,10 +164,10 @@ func cleanup(cmd *cobra.Command) {
 		vip.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 		vip.AutomaticEnv()
 
-		cfgFlag := cmd.Flags().Lookup("config")
+		cfgFlag := cmd.Flags().Lookup("config-dir")
 		if cfgFlag != nil && cfgFlag.Value.String() != "" {
-			path := os.ExpandEnv(cfgFlag.Value.String())
-			if cfgFlag.Changed || fileExists(path) {
+			path := filepath.Join(os.ExpandEnv(cfgFlag.Value.String()), "config.yaml")
+			if cmd.Annotations["type"] != "setup" || fileExists(path) {
 				vip.SetConfigFile(path)
 				err = vip.ReadInConfig()
 				if err != nil {
@@ -141,11 +184,14 @@ func cleanup(cmd *cobra.Command) {
 				// flag couldn't be found
 				brokenKeys = append(brokenKeys, key)
 			} else {
+				oldChanged := cmd.Flag(key).Changed
 				err := cmd.Flags().Set(key, vip.GetString(key))
 				if err != nil {
 					// flag couldn't be set
 					brokenVals = append(brokenVals, key)
 				}
+				// revert Changed value
+				cmd.Flag(key).Changed = oldChanged
 			}
 		}
 
@@ -153,11 +199,20 @@ func cleanup(cmd *cobra.Command) {
 		if err != nil {
 			return err
 		}
+
+		if vip.ConfigFileUsed() != "" {
+			path, err := filepath.Abs(vip.ConfigFileUsed())
+			if err != nil {
+				path = vip.ConfigFileUsed()
+				logger.Debug("unable to resolve path", zap.Error(err))
+			}
+
+			logger.Sugar().Info("Configuration loaded from: ", path)
+		}
+
 		defer func() { _ = logger.Sync() }()
 		defer zap.ReplaceGlobals(logger)()
 		defer zap.RedirectStdLog(logger)()
-
-		logger.Debug("logging initialized")
 
 		// okay now that logging is working, inform about the broken keys
 		for _, key := range brokenKeys {
@@ -165,12 +220,6 @@ func cleanup(cmd *cobra.Command) {
 		}
 		for _, key := range brokenVals {
 			logger.Sugar().Infof("Invalid configuration file value for key: %s", key)
-		}
-
-		err = initMetrics(ctx, monkit.Default,
-			telemetry.DefaultInstanceID())
-		if err != nil {
-			logger.Error("failed to configure telemetry", zap.Error(err))
 		}
 
 		err = initDebug(logger, monkit.Default)

@@ -3,6 +3,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/storj/storj)](https://goreportcard.com/report/github.com/storj/storj)
 [![Go Doc](https://img.shields.io/badge/godoc-reference-blue.svg?style=flat-square)](http://godoc.org/github.com/storj/storj)
 [![Coverage Status](https://coveralls.io/repos/github/storj/storj/badge.svg?branch=master)](https://coveralls.io/github/storj/storj?branch=master)
+![Alpha](https://img.shields.io/badge/version-alpha-green.svg)
 
 <img src="https://github.com/storj/storj/raw/master/resources/logo.png" width="100">
 
@@ -95,12 +96,12 @@ Use Github to open a pull request!
 
 # Start using Storj
 
-We have another repository dedicated to [documentation and tutorials](https://github.com/storj/docs).
+Our wiki has [documentation and tutorials](https://github.com/storj/storj/wiki).
 Check out these three tutorials:
 
- * [Using the Storj Test Network](https://github.com/storj/docs/blob/master/test-network.md)
- * [Using the Uplink CLI](https://github.com/storj/docs/blob/master/uplink-cli.md)
- * [Using the S3 Gateway](https://github.com/storj/docs/blob/master/s3-gateway.md)
+ * [Using the Storj Test Network](https://github.com/storj/storj/wiki/Test-network)
+ * [Using the Uplink CLI](https://github.com/storj/storj/wiki/Uplink-CLI)
+ * [Using the S3 Gateway](https://github.com/storj/storj/wiki/S3-Gateway)
 
 # License
 

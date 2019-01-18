@@ -5,7 +5,13 @@ package storj
 
 // EncryptionScheme is the scheme and parameters used for encryption
 type EncryptionScheme struct {
-	Cipher Cipher
+	Cipher    Cipher
+	BlockSize int32
+}
+
+// IsZero returns true if no field in the struct is set to non-zero value
+func (scheme EncryptionScheme) IsZero() bool {
+	return scheme == (EncryptionScheme{})
 }
 
 // Cipher specifies an encryption algorithm

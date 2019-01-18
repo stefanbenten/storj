@@ -3,22 +3,41 @@
 
 package storj
 
-import "time"
+import (
+	"time"
+
+	"github.com/zeebo/errs"
+)
+
+var (
+	// ErrNoBucket is an error class for using empty bucket name
+	ErrNoBucket = errs.Class("no bucket specified")
+
+	// ErrNoPath is an error class for using empty path
+	ErrNoPath = errs.Class("no path specified")
+
+	// ErrBucketNotFound is an error class for non-existing bucket
+	ErrBucketNotFound = errs.Class("bucket not found")
+
+	// ErrObjectNotFound is an error class for non-existing object
+	ErrObjectNotFound = errs.Class("object not found")
+)
 
 // Bucket contains information about a specific bucket
 type Bucket struct {
-	Name    string
-	Created time.Time
+	Name       string
+	Created    time.Time
+	PathCipher Cipher
 }
 
 // Object contains information about a specific object
 type Object struct {
 	Version  uint32
-	Bucket   string
+	Bucket   Bucket
 	Path     Path
 	IsPrefix bool
 
-	Metadata []byte
+	Metadata map[string]string
 
 	ContentType string
 	Created     time.Time
@@ -45,6 +64,16 @@ type Stream struct {
 	RedundancyScheme
 	// EncryptionScheme specifies encryption strategy used for this stream
 	EncryptionScheme
+
+	LastSegment LastSegment // TODO: remove
+}
+
+// LastSegment contains info about last segment
+// TODO: remove
+type LastSegment struct {
+	Size              int64
+	EncryptedKeyNonce Nonce
+	EncryptedKey      EncryptedPrivateKey
 }
 
 // Segment is full segment information

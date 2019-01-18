@@ -5,28 +5,21 @@ package pdbclient
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
-	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
-	"github.com/gtank/cryptopasta"
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/peer"
+
+	"storj.io/storj/internal/teststorj"
 
 	"storj.io/storj/pkg/auth"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/storage/meta"
 	"storj.io/storj/pkg/storj"
 )
@@ -48,10 +41,10 @@ func TestNewPointerDBClient(t *testing.T) {
 	defer ctrl.Finish()
 
 	gc := NewMockPointerDBClient(ctrl)
-	pdb := PointerDB{grpcClient: gc}
+	pdb := PointerDB{client: gc}
 
 	assert.NotNil(t, pdb)
-	assert.NotNil(t, pdb.grpcClient)
+	assert.NotNil(t, pdb.client)
 }
 
 func makePointer(path storj.Path) pb.PutRequest {
@@ -60,7 +53,7 @@ func makePointer(path storj.Path) pb.PutRequest {
 	var rps []*pb.RemotePiece
 	rps = append(rps, &pb.RemotePiece{
 		PieceNum: 1,
-		NodeId:   "testId",
+		NodeId:   teststorj.NodeIDFromString("testId"),
 	})
 	pr := pb.PutRequest{
 		Path: path,
@@ -77,7 +70,7 @@ func makePointer(path storj.Path) pb.PutRequest {
 				PieceId:      "testId",
 				RemotePieces: rps,
 			},
-			Size: int64(1),
+			SegmentSize: int64(1),
 		},
 	}
 	return pr
@@ -106,7 +99,7 @@ func TestPut(t *testing.T) {
 
 		errTag := fmt.Sprintf("Test case #%d", i)
 		gc := NewMockPointerDBClient(ctrl)
-		pdb := PointerDB{grpcClient: gc}
+		pdb := PointerDB{client: gc}
 
 		// here we don't care what type of context we pass
 		gc.EXPECT().Put(gomock.Any(), &putRequest).Return(nil, tt.err)
@@ -153,22 +146,28 @@ func TestGet(t *testing.T) {
 		err = proto.Unmarshal(byteData, ptr)
 		assert.NoError(t, err)
 
-		getResponse := pb.GetResponse{Pointer: ptr}
+		getResponse := pb.GetResponse{Pointer: ptr, Nodes: []*pb.Node{}, Pba: &pb.PayerBandwidthAllocation{}}
 
 		errTag := fmt.Sprintf("Test case #%d", i)
 
 		gc := NewMockPointerDBClient(ctrl)
-		pdb := PointerDB{grpcClient: gc}
+		pdb := PointerDB{client: gc}
 
 		gc.EXPECT().Get(gomock.Any(), &getRequest).Return(&getResponse, tt.err)
 
-		pointer, err := pdb.Get(ctx, tt.path)
-
+		pointer, nodes, pba, err := pdb.Get(ctx, tt.path)
+		for _, v := range nodes {
+			v.Type.DPanicOnInvalid("client test")
+		}
 		if err != nil {
 			assert.True(t, strings.Contains(err.Error(), tt.errString), errTag)
 			assert.Nil(t, pointer)
+			assert.Nil(t, nodes)
+			assert.Nil(t, pba)
 		} else {
 			assert.NotNil(t, pointer)
+			assert.NotNil(t, nodes)
+			assert.NotNil(t, pba)
 			assert.NoError(t, err, errTag)
 		}
 	}
@@ -205,7 +204,7 @@ func TestList(t *testing.T) {
 		{"prefix", "after", "before", false, 1, meta.All, "some key",
 			[]*pb.ListResponse_Item{
 				{Path: "a/b/c", Pointer: &pb.Pointer{
-					Size:           1234,
+					SegmentSize:    1234,
 					CreationDate:   ptypes.TimestampNow(),
 					ExpirationDate: ptypes.TimestampNow(),
 				}},
@@ -213,8 +212,8 @@ func TestList(t *testing.T) {
 			true, nil, ""},
 		{"some/prefix", "start/after", "end/before", true, 123, meta.Size, "some key",
 			[]*pb.ListResponse_Item{
-				{Path: "a/b/c", Pointer: &pb.Pointer{Size: 1234}},
-				{Path: "x/y", Pointer: &pb.Pointer{Size: 789}},
+				{Path: "a/b/c", Pointer: &pb.Pointer{SegmentSize: 1234}},
+				{Path: "x/y", Pointer: &pb.Pointer{SegmentSize: 789}},
 			},
 			true, nil, ""},
 	} {
@@ -235,7 +234,7 @@ func TestList(t *testing.T) {
 		listResponse := pb.ListResponse{Items: tt.items, More: tt.more}
 
 		gc := NewMockPointerDBClient(ctrl)
-		pdb := PointerDB{grpcClient: gc}
+		pdb := PointerDB{client: gc}
 
 		gc.EXPECT().List(gomock.Any(), &listRequest).Return(&listResponse, tt.err)
 
@@ -253,7 +252,7 @@ func TestList(t *testing.T) {
 
 			for i := 0; i < len(items); i++ {
 				assert.Equal(t, tt.items[i].GetPath(), items[i].Path)
-				assert.Equal(t, tt.items[i].GetPointer().GetSize(), items[i].Pointer.GetSize())
+				assert.Equal(t, tt.items[i].GetPointer().GetSegmentSize(), items[i].Pointer.GetSegmentSize())
 				assert.Equal(t, tt.items[i].GetPointer().GetCreationDate(), items[i].Pointer.GetCreationDate())
 				assert.Equal(t, tt.items[i].GetPointer().GetExpirationDate(), items[i].Pointer.GetExpirationDate())
 			}
@@ -284,7 +283,7 @@ func TestDelete(t *testing.T) {
 
 		errTag := fmt.Sprintf("Test case #%d", i)
 		gc := NewMockPointerDBClient(ctrl)
-		pdb := PointerDB{grpcClient: gc}
+		pdb := PointerDB{client: gc}
 
 		gc.EXPECT().Delete(gomock.Any(), &deleteRequest).Return(nil, tt.err)
 
@@ -296,40 +295,4 @@ func TestDelete(t *testing.T) {
 			assert.NoError(t, err, errTag)
 		}
 	}
-}
-
-func TestSignedMessage(t *testing.T) {
-	ctx := context.Background()
-	ca, err := provider.NewTestCA(ctx)
-	assert.NoError(t, err)
-	identity, err := ca.NewIdentity()
-	assert.NoError(t, err)
-
-	peerCertificates := make([]*x509.Certificate, 2)
-	peerCertificates[0] = identity.Leaf
-	peerCertificates[1] = identity.CA
-
-	info := credentials.TLSInfo{State: tls.ConnectionState{PeerCertificates: peerCertificates}}
-
-	signature := base64.StdEncoding.EncodeToString([]byte("some value"))
-
-	header := metadata.Pairs("signature", signature)
-	peer := &peer.Peer{AuthInfo: info}
-	pointerdb := &PointerDB{
-		signatureHeader: &header,
-		peer:            peer,
-	}
-
-	auth, err := pointerdb.SignedMessage()
-	assert.NoError(t, err)
-
-	pk, ok := identity.Leaf.PublicKey.(*ecdsa.PublicKey)
-	assert.Equal(t, true, ok)
-
-	expectedKey, err := cryptopasta.EncodePublicKey(pk)
-	assert.NoError(t, err)
-
-	assert.Equal(t, expectedKey, auth.GetPublicKey())
-	assert.Equal(t, identity.ID.Bytes(), auth.GetData())
-	assert.Equal(t, "some value", string(auth.GetSignature()))
 }

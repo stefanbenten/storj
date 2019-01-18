@@ -8,18 +8,16 @@ import (
 	"context"
 	"io"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/vivint/infectious"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
-	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/overlay"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/piecestore/rpc/client"
+	"storj.io/storj/pkg/piecestore/psclient"
 	"storj.io/storj/pkg/provider"
-	sdbproto "storj.io/storj/pkg/statdb/proto"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/transport"
+	"storj.io/storj/pkg/utils"
 )
 
 var mon = monkit.Package()
@@ -36,7 +34,8 @@ type Verifier struct {
 }
 
 type downloader interface {
-	DownloadShares(ctx context.Context, pointer *pb.Pointer, stripeIndex int, authorization *pb.SignedMessage) (shares []share, nodes []*pb.Node, err error)
+	DownloadShares(ctx context.Context, pointer *pb.Pointer, stripeIndex int, pba *pb.PayerBandwidthAllocation,
+		authorization *pb.SignedMessage) (shares map[int]share, nodes map[int]*pb.Node, err error)
 }
 
 // defaultDownloader downloads shares from networked storage nodes
@@ -57,41 +56,24 @@ func NewVerifier(transport transport.Client, overlay overlay.Client, id provider
 	return &Verifier{downloader: newDefaultDownloader(transport, overlay, id)}
 }
 
-func (d *defaultDownloader) dial(ctx context.Context, storageNode *pb.Node) (ps client.PSClient, err error) {
-	defer mon.Task()(&ctx)(&err)
-	c, err := d.transport.DialNode(ctx, storageNode)
-	if err != nil {
-		return nil, err
-	}
-	return client.NewPSClient(c, node.IDFromString(storageNode.GetId()), 0, d.identity.Key)
-}
-
 // getShare use piece store clients to download shares from a given node
 func (d *defaultDownloader) getShare(ctx context.Context, stripeIndex, shareSize, pieceNumber int,
-	id client.PieceID, pieceSize int64, node *pb.Node, authorization *pb.SignedMessage) (s share, err error) {
+	id psclient.PieceID, pieceSize int64, fromNode *pb.Node, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (s share, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	ps, err := d.dial(ctx, node)
+	if fromNode == nil {
+		// TODO(moby) perhaps we should not penalize this node's reputation if it is not returned by the overlay
+		return s, Error.New("no node returned from overlay for piece %s", id.String())
+	}
+	fromNode.Type.DPanicOnInvalid("audit getShare")
+	ps, err := psclient.NewPSClient(ctx, d.transport, fromNode, 0)
 	if err != nil {
 		return s, err
 	}
 
-	derivedPieceID, err := id.Derive([]byte(node.GetId()))
+	derivedPieceID, err := id.Derive(fromNode.Id.Bytes())
 	if err != nil {
 		return s, err
-	}
-
-	allocationData := &pb.PayerBandwidthAllocation_Data{
-		Action: pb.PayerBandwidthAllocation_GET,
-	}
-
-	serializedAllocation, err := proto.Marshal(allocationData)
-	if err != nil {
-		return s, err
-	}
-
-	pba := &pb.PayerBandwidthAllocation{
-		Data: serializedAllocation,
 	}
 
 	rr, err := ps.Get(ctx, derivedPieceID, pieceSize, pba, authorization)
@@ -105,6 +87,7 @@ func (d *defaultDownloader) getShare(ctx context.Context, stripeIndex, shareSize
 	if err != nil {
 		return s, err
 	}
+	defer utils.LogClose(rc)
 
 	buf := make([]byte, shareSize)
 	_, err = io.ReadFull(rc, buf)
@@ -122,69 +105,72 @@ func (d *defaultDownloader) getShare(ctx context.Context, stripeIndex, shareSize
 
 // Download Shares downloads shares from the nodes where remote pieces are located
 func (d *defaultDownloader) DownloadShares(ctx context.Context, pointer *pb.Pointer,
-	stripeIndex int, authorization *pb.SignedMessage) (shares []share, nodes []*pb.Node, err error) {
+	stripeIndex int, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (shares map[int]share, nodes map[int]*pb.Node, err error) {
 	defer mon.Task()(&ctx)(&err)
-	var nodeIds []dht.NodeID
+
+	var nodeIds storj.NodeIDList
 	pieces := pointer.Remote.GetRemotePieces()
 
 	for _, p := range pieces {
-		nodeIds = append(nodeIds, node.IDFromString(p.GetNodeId()))
+		nodeIds = append(nodeIds, p.NodeId)
 	}
-	nodes, err = d.overlay.BulkLookup(ctx, nodeIds)
+
+	// TODO(moby) nodeSlice will not include offline nodes, so overlay should update uptime for these nodes
+	nodeSlice, err := d.overlay.BulkLookup(ctx, nodeIds)
 	if err != nil {
 		return nil, nodes, err
 	}
 
+	shares = make(map[int]share, len(nodeSlice))
+	nodes = make(map[int]*pb.Node, len(nodeSlice))
+
 	shareSize := int(pointer.Remote.Redundancy.GetErasureShareSize())
-	pieceID := client.PieceID(pointer.Remote.GetPieceId())
+	pieceID := psclient.PieceID(pointer.Remote.GetPieceId())
 
 	// this downloads shares from nodes at the given stripe index
-	for i, node := range nodes {
-		paddedSize := calcPadded(pointer.GetSize(), shareSize)
+	for i, node := range nodeSlice {
+		paddedSize := calcPadded(pointer.GetSegmentSize(), shareSize)
 		pieceSize := paddedSize / int64(pointer.Remote.Redundancy.GetMinReq())
 
-		s, err := d.getShare(ctx, stripeIndex, shareSize, i, pieceID, pieceSize, node, authorization)
+		s, err := d.getShare(ctx, stripeIndex, shareSize, int(pieces[i].PieceNum), pieceID, pieceSize, node, pba, authorization)
 		if err != nil {
 			s = share{
 				Error:       err,
-				PieceNumber: i,
+				PieceNumber: int(pieces[i].PieceNum),
 				Data:        nil,
 			}
 		}
-		shares = append(shares, s)
+
+		shares[s.PieceNumber] = s
+		nodes[s.PieceNumber] = node
 	}
 
 	return shares, nodes, nil
 }
 
-func makeCopies(ctx context.Context, originals []share) (copies []infectious.Share, err error) {
+func makeCopies(ctx context.Context, originals map[int]share) (copies []infectious.Share, err error) {
 	defer mon.Task()(&ctx)(&err)
-	// Have to use []infectious.Share instead of []audit.Share
-	// in order to run the infectious Correct function.
-	copies = make([]infectious.Share, len(originals))
-	for i, original := range originals {
-
-		// If there was an error downloading a share before,
-		// this line makes it so that there will be an empty
-		// infectious.Share at the copies' index (same index
-		// as in the original slice).
+	copies = make([]infectious.Share, 0, len(originals))
+	for _, original := range originals {
 		if original.Error != nil {
 			continue
 		}
-		copies[i].Data = append([]byte(nil), original.Data...)
-		copies[i].Number = original.PieceNumber
+		copies = append(copies, infectious.Share{
+			Data:   append([]byte{}, original.Data...),
+			Number: original.PieceNumber})
 	}
 	return copies, nil
 }
 
 // auditShares takes the downloaded shares and uses infectious's Correct function to check that they
 // haven't been altered. auditShares returns a slice containing the piece numbers of altered shares.
-func auditShares(ctx context.Context, required, total int, originals []share) (pieceNums []int, err error) {
+func auditShares(ctx context.Context, required, total int, originals map[int]share) (pieceNums []int, err error) {
 	defer mon.Task()(&ctx)(&err)
 	f, err := infectious.NewFEC(required, total)
 	if err != nil {
 		return nil, err
 	}
+
 	copies, err := makeCopies(ctx, originals)
 	if err != nil {
 		return nil, err
@@ -194,8 +180,8 @@ func auditShares(ctx context.Context, required, total int, originals []share) (p
 	if err != nil {
 		return nil, err
 	}
-	for i, share := range copies {
-		if !bytes.Equal(originals[i].Data, share.Data) {
+	for _, share := range copies {
+		if !bytes.Equal(originals[share.Number].Data, share.Data) {
 			pieceNums = append(pieceNums, share.Number)
 		}
 	}
@@ -211,21 +197,22 @@ func calcPadded(size int64, blockSize int) int64 {
 }
 
 // verify downloads shares then verifies the data correctness at the given stripe
-func (verifier *Verifier) verify(ctx context.Context, stripeIndex int, pointer *pb.Pointer, authorization *pb.SignedMessage) (verifiedNodes []*sdbproto.Node, err error) {
+func (verifier *Verifier) verify(ctx context.Context, stripe *Stripe) (verifiedNodes *RecordAuditsInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	shares, nodes, err := verifier.downloader.DownloadShares(ctx, pointer, stripeIndex, authorization)
+	shares, nodes, err := verifier.downloader.DownloadShares(ctx, stripe.Segment, stripe.Index, stripe.PBA, stripe.Authorization)
 	if err != nil {
 		return nil, err
 	}
 
-	var offlineNodes []string
-	for i, share := range shares {
-		if shares[i].Error != nil {
-			offlineNodes = append(offlineNodes, nodes[share.PieceNumber].GetId())
+	var offlineNodes storj.NodeIDList
+	for pieceNum := range shares {
+		if shares[pieceNum].Error != nil {
+			offlineNodes = append(offlineNodes, nodes[pieceNum].Id)
 		}
 	}
 
+	pointer := stripe.Segment
 	required := int(pointer.Remote.Redundancy.GetMinReq())
 	total := int(pointer.Remote.Redundancy.GetTotal())
 	pieceNums, err := auditShares(ctx, required, total, shares)
@@ -233,20 +220,23 @@ func (verifier *Verifier) verify(ctx context.Context, stripeIndex int, pointer *
 		return nil, err
 	}
 
-	var failedNodes []string
+	var failedNodes storj.NodeIDList
 	for _, pieceNum := range pieceNums {
-		failedNodes = append(failedNodes, nodes[pieceNum].GetId())
+		failedNodes = append(failedNodes, nodes[pieceNum].Id)
 	}
 
 	successNodes := getSuccessNodes(ctx, nodes, failedNodes, offlineNodes)
-	verifiedNodes = setVerifiedNodes(ctx, nodes, offlineNodes, failedNodes, successNodes)
 
-	return verifiedNodes, nil
+	return &RecordAuditsInfo{
+		SuccessNodeIDs: successNodes,
+		FailNodeIDs:    failedNodes,
+		OfflineNodeIDs: offlineNodes,
+	}, nil
 }
 
 // getSuccessNodes uses the failed nodes and offline nodes arrays to determine which nodes passed the audit
-func getSuccessNodes(ctx context.Context, nodes []*pb.Node, failedNodes, offlineNodes []string) (successNodes []string) {
-	fails := make(map[string]bool)
+func getSuccessNodes(ctx context.Context, nodes map[int]*pb.Node, failedNodes, offlineNodes storj.NodeIDList) (successNodes storj.NodeIDList) {
+	fails := make(map[storj.NodeID]bool)
 	for _, fail := range failedNodes {
 		fails[fail] = true
 	}
@@ -255,22 +245,9 @@ func getSuccessNodes(ctx context.Context, nodes []*pb.Node, failedNodes, offline
 	}
 
 	for _, node := range nodes {
-		if !fails[node.GetId()] {
-			successNodes = append(successNodes, node.GetId())
+		if !fails[node.Id] {
+			successNodes = append(successNodes, node.Id)
 		}
 	}
 	return successNodes
-}
-
-// setVerifiedNodes creates a combined array of offline nodes, failed audit nodes, and success nodes with their stats set to the statdb proto Node type
-func setVerifiedNodes(ctx context.Context, nodes []*pb.Node, offlineNodes, failedNodes, successNodes []string) (verifiedNodes []*sdbproto.Node) {
-	offlineStatusNodes := setOfflineStatus(ctx, offlineNodes)
-	failStatusNodes := setAuditFailStatus(ctx, failedNodes)
-	successStatusNodes := setSuccessStatus(ctx, successNodes)
-
-	verifiedNodes = append(verifiedNodes, offlineStatusNodes...)
-	verifiedNodes = append(verifiedNodes, failStatusNodes...)
-	verifiedNodes = append(verifiedNodes, successStatusNodes...)
-
-	return verifiedNodes
 }

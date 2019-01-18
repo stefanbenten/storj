@@ -11,20 +11,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 
+	"storj.io/storj/internal/teststorj"
 	"storj.io/storj/pkg/auth"
 	"storj.io/storj/pkg/datarepair/queue"
-	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/overlay"
 	"storj.io/storj/pkg/overlay/mocks"
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/pointerdb"
+	"storj.io/storj/pkg/storj"
+	"storj.io/storj/satellite/satellitedb"
 	"storj.io/storj/storage/redis"
 	"storj.io/storj/storage/redis/redisserver"
+	"storj.io/storj/storage/testqueue"
 	"storj.io/storj/storage/teststore"
 )
 
@@ -33,8 +35,9 @@ var ctx = context.Background()
 func TestIdentifyInjuredSegments(t *testing.T) {
 	logger := zap.NewNop()
 	pointerdb := pointerdb.NewServer(teststore.New(), &overlay.Cache{}, logger, pointerdb.Config{}, nil)
+	assert.NotNil(t, pointerdb)
 
-	repairQueue := queue.NewQueue(teststore.New())
+	repairQueue := queue.NewQueue(testqueue.New())
 
 	const N = 25
 	nodes := []*pb.Node{}
@@ -42,7 +45,7 @@ func TestIdentifyInjuredSegments(t *testing.T) {
 	//fill a pointerdb
 	for i := 0; i < N; i++ {
 		s := strconv.Itoa(i)
-		ids := []string{s + "a", s + "b", s + "c", s + "d"}
+		ids := teststorj.NodeIDsFromStrings([]string{s + "a", s + "b", s + "c", s + "d"}...)
 
 		p := &pb.Pointer{
 			Remote: &pb.RemoteSegment{
@@ -70,7 +73,7 @@ func TestIdentifyInjuredSegments(t *testing.T) {
 		//nodes for cache
 		selection := rand.Intn(4)
 		for _, v := range ids[:selection] {
-			n := &pb.Node{Id: v, Address: &pb.NodeAddress{Address: v}}
+			n := &pb.Node{Id: v, Type: pb.NodeType_STORAGE, Address: &pb.NodeAddress{Address: ""}}
 			nodes = append(nodes, n)
 		}
 		pieces := []int32{0, 1, 2, 3}
@@ -87,14 +90,24 @@ func TestIdentifyInjuredSegments(t *testing.T) {
 	overlayServer := mocks.NewOverlay(nodes)
 	limit := 0
 	interval := time.Second
-	checker := newChecker(pointerdb, repairQueue, overlayServer, limit, logger, interval)
-	err := checker.IdentifyInjuredSegments(ctx)
+	// creating in-memory db and opening connection
+	db, err := satellitedb.NewInMemory()
+	assert.NoError(t, err)
+	defer func() {
+		err = db.Close()
+		assert.NoError(t, err)
+	}()
+	err = db.CreateTables()
+	assert.NoError(t, err)
+	checker := newChecker(pointerdb, db.StatDB(), repairQueue, overlayServer, db.Irreparable(), limit, logger, interval)
+	assert.NoError(t, err)
+	err = checker.identifyInjuredSegments(ctx)
 	assert.NoError(t, err)
 
 	//check if the expected segments were added to the queue
 	dequeued := []*pb.InjuredSegment{}
 	for i := 0; i < len(segs); i++ {
-		injSeg, err := repairQueue.Dequeue()
+		injSeg, err := repairQueue.Dequeue(ctx)
 		assert.NoError(t, err)
 		dequeued = append(dequeued, &injSeg)
 	}
@@ -106,32 +119,41 @@ func TestIdentifyInjuredSegments(t *testing.T) {
 	}
 }
 
-func TestOfflineAndOnlineNodes(t *testing.T) {
+func TestOfflineNodes(t *testing.T) {
 	logger := zap.NewNop()
 	pointerdb := pointerdb.NewServer(teststore.New(), &overlay.Cache{}, logger, pointerdb.Config{}, nil)
+	assert.NotNil(t, pointerdb)
 
-	repairQueue := queue.NewQueue(teststore.New())
+	repairQueue := queue.NewQueue(testqueue.New())
 	const N = 50
 	nodes := []*pb.Node{}
-	nodeIDs := []dht.NodeID{}
+	nodeIDs := storj.NodeIDList{}
 	expectedOffline := []int32{}
 	for i := 0; i < N; i++ {
-		str := strconv.Itoa(i)
-		n := &pb.Node{Id: str, Address: &pb.NodeAddress{Address: str}}
+		id := teststorj.NodeIDFromString(strconv.Itoa(i))
+		n := &pb.Node{Id: id, Type: pb.NodeType_STORAGE, Address: &pb.NodeAddress{Address: ""}}
 		nodes = append(nodes, n)
 		if i%(rand.Intn(5)+2) == 0 {
-			id := node.IDFromString("id" + str)
-			nodeIDs = append(nodeIDs, id)
+			nodeIDs = append(nodeIDs, teststorj.NodeIDFromString("id"+id.String()))
 			expectedOffline = append(expectedOffline, int32(i))
 		} else {
-			id := node.IDFromString(str)
 			nodeIDs = append(nodeIDs, id)
 		}
 	}
 	overlayServer := mocks.NewOverlay(nodes)
 	limit := 0
 	interval := time.Second
-	checker := newChecker(pointerdb, repairQueue, overlayServer, limit, logger, interval)
+	// creating in-memory db and opening connection
+	db, err := satellitedb.NewInMemory()
+	assert.NoError(t, err)
+	defer func() {
+		err = db.Close()
+		assert.NoError(t, err)
+	}()
+	err = db.CreateTables()
+	assert.NoError(t, err)
+	checker := newChecker(pointerdb, db.StatDB(), repairQueue, overlayServer, db.Irreparable(), limit, logger, interval)
+	assert.NoError(t, err)
 	offline, err := checker.offlineNodes(ctx, nodeIDs)
 	assert.NoError(t, err)
 	assert.Equal(t, expectedOffline, offline)
@@ -140,11 +162,21 @@ func TestOfflineAndOnlineNodes(t *testing.T) {
 func BenchmarkIdentifyInjuredSegments(b *testing.B) {
 	logger := zap.NewNop()
 	pointerdb := pointerdb.NewServer(teststore.New(), &overlay.Cache{}, logger, pointerdb.Config{}, nil)
+	assert.NotNil(b, pointerdb)
+
+	// creating in-memory db and opening connection
+	db, err := satellitedb.NewInMemory()
+	defer func() {
+		err = db.Close()
+		assert.NoError(b, err)
+	}()
+	err = db.CreateTables()
+	assert.NoError(b, err)
 
 	addr, cleanup, err := redisserver.Start()
 	defer cleanup()
 	assert.NoError(b, err)
-	client, err := redis.NewClient(addr, "", 1)
+	client, err := redis.NewQueue(addr, "", 1)
 	assert.NoError(b, err)
 	repairQueue := queue.NewQueue(client)
 
@@ -154,7 +186,7 @@ func BenchmarkIdentifyInjuredSegments(b *testing.B) {
 	//fill a pointerdb
 	for i := 0; i < N; i++ {
 		s := strconv.Itoa(i)
-		ids := []string{s + "a", s + "b", s + "c", s + "d"}
+		ids := teststorj.NodeIDsFromStrings([]string{s + "a", s + "b", s + "c", s + "d"}...)
 
 		p := &pb.Pointer{
 			Remote: &pb.RemoteSegment{
@@ -182,7 +214,7 @@ func BenchmarkIdentifyInjuredSegments(b *testing.B) {
 		//nodes for cache
 		selection := rand.Intn(4)
 		for _, v := range ids[:selection] {
-			n := &pb.Node{Id: v, Address: &pb.NodeAddress{Address: v}}
+			n := &pb.Node{Id: v, Type: pb.NodeType_STORAGE, Address: &pb.NodeAddress{Address: ""}}
 			nodes = append(nodes, n)
 		}
 		pieces := []int32{0, 1, 2, 3}
@@ -201,14 +233,17 @@ func BenchmarkIdentifyInjuredSegments(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		interval := time.Second
-		checker := newChecker(pointerdb, repairQueue, overlayServer, limit, logger, interval)
-		err = checker.IdentifyInjuredSegments(ctx)
+		assert.NoError(b, err)
+		checker := newChecker(pointerdb, db.StatDB(), repairQueue, overlayServer, db.Irreparable(), limit, logger, interval)
+		assert.NoError(b, err)
+
+		err = checker.identifyInjuredSegments(ctx)
 		assert.NoError(b, err)
 
 		//check if the expected segments were added to the queue
 		dequeued := []*pb.InjuredSegment{}
 		for i := 0; i < len(segs); i++ {
-			injSeg, err := repairQueue.Dequeue()
+			injSeg, err := repairQueue.Dequeue(ctx)
 			assert.NoError(b, err)
 			dequeued = append(dequeued, &injSeg)
 		}

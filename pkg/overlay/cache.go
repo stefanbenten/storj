@@ -5,20 +5,15 @@ package overlay
 
 import (
 	"context"
-	"crypto/rand"
-	"log"
+	"errors"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 
-	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/pb"
+	"storj.io/storj/pkg/statdb"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/storage"
-	"storj.io/storj/storage/boltdb"
-	"storj.io/storj/storage/redis"
-	"storj.io/storj/storage/storelogger"
 )
 
 const (
@@ -26,186 +21,126 @@ const (
 	OverlayBucket = "overlay"
 )
 
-// ErrNodeNotFound error standardization
+// ErrEmptyNode is returned when the nodeID is empty
+var ErrEmptyNode = errs.New("empty node ID")
+
+// ErrNodeNotFound is returned if a node does not exist in database
 var ErrNodeNotFound = errs.New("Node not found")
+
+// ErrBucketNotFound is returned if a bucket is unable to be found in the routing table
+var ErrBucketNotFound = errs.New("Bucket not found")
 
 // OverlayError creates class of errors for stack traces
 var OverlayError = errs.Class("Overlay Error")
 
+// DB implements the database for overlay.Cache
+type DB interface {
+	// Get looks up the node by nodeID
+	Get(ctx context.Context, nodeID storj.NodeID) (*pb.Node, error)
+	// GetAll looks up nodes based on the ids from the overlay cache
+	GetAll(ctx context.Context, nodeIDs storj.NodeIDList) ([]*pb.Node, error)
+	// List lists nodes starting from cursor
+	List(ctx context.Context, cursor storj.NodeID, limit int) ([]*pb.Node, error)
+	// Update updates node information
+	Update(ctx context.Context, value *pb.Node) error
+	// Delete deletes node based on id
+	Delete(ctx context.Context, id storj.NodeID) error
+	//GetWalletAddress gets the node's wallet address
+	GetWalletAddress(ctx context.Context, id storj.NodeID) (string, error)
+}
+
 // Cache is used to store overlay data in Redis
 type Cache struct {
-	DB  storage.KeyValueStore
-	DHT dht.DHT
+	db     DB
+	statDB statdb.DB
 }
 
-// NewRedisOverlayCache returns a pointer to a new Cache instance with an initialized connection to Redis.
-func NewRedisOverlayCache(address, password string, dbindex int, dht dht.DHT) (*Cache, error) {
-	db, err := redis.NewClient(address, password, dbindex)
-	if err != nil {
-		return nil, err
-	}
-	return NewOverlayCache(storelogger.New(zap.L(), db), dht), nil
+// NewCache returns a new Cache
+func NewCache(db DB, sdb statdb.DB) *Cache {
+	return &Cache{db: db, statDB: sdb}
 }
 
-// NewBoltOverlayCache returns a pointer to a new Cache instance with an initialized connection to a Bolt db.
-func NewBoltOverlayCache(dbPath string, dht dht.DHT) (*Cache, error) {
-	db, err := boltdb.New(dbPath, OverlayBucket)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewOverlayCache(storelogger.New(zap.L(), db), dht), nil
-}
-
-// NewOverlayCache returns a new Cache
-func NewOverlayCache(db storage.KeyValueStore, dht dht.DHT) *Cache {
-	return &Cache{
-		DB:  db,
-		DHT: dht,
-	}
+// Inspect lists limited number of items in the cache
+func (cache *Cache) Inspect(ctx context.Context) (storage.Keys, error) {
+	// TODO: implement inspection tools
+	return nil, errors.New("not implemented")
 }
 
 // Get looks up the provided nodeID from the overlay cache
-func (o *Cache) Get(ctx context.Context, key string) (*pb.Node, error) {
-	b, err := o.DB.Get([]byte(key))
-	if err != nil {
-		return nil, err
-	}
-	if b.IsZero() {
-		// TODO: log? return an error?
-		return nil, nil
+func (cache *Cache) Get(ctx context.Context, nodeID storj.NodeID) (*pb.Node, error) {
+	if nodeID.IsZero() {
+		return nil, ErrEmptyNode
 	}
 
-	na := &pb.Node{}
-	if err := proto.Unmarshal(b, na); err != nil {
-		return nil, err
-	}
-
-	return na, nil
+	return cache.db.Get(ctx, nodeID)
 }
 
-// GetAll looks up the provided nodeIDs from the overlay cache
-func (o *Cache) GetAll(ctx context.Context, keys []string) ([]*pb.Node, error) {
-	if len(keys) == 0 {
-		return nil, OverlayError.New("no keys provided")
+// GetAll looks up the provided ids from the overlay cache
+func (cache *Cache) GetAll(ctx context.Context, ids storj.NodeIDList) ([]*pb.Node, error) {
+	if len(ids) == 0 {
+		return nil, OverlayError.New("no ids provided")
 	}
-	var ks storage.Keys
-	for _, v := range keys {
-		ks = append(ks, storage.Key(v))
-	}
-	vs, err := o.DB.GetAll(ks)
-	if err != nil {
-		return nil, err
-	}
-	var ns []*pb.Node
-	for _, v := range vs {
-		if v == nil {
-			ns = append(ns, nil)
-			continue
-		}
-		na := &pb.Node{}
-		err := proto.Unmarshal(v, na)
-		if err != nil {
-			return nil, OverlayError.New("could not unmarshal non-nil node: %v", err)
-		}
-		ns = append(ns, na)
-	}
-	return ns, nil
+
+	return cache.db.GetAll(ctx, ids)
 }
 
 // Put adds a nodeID to the redis cache with a binary representation of proto defined Node
-func (o *Cache) Put(nodeID string, value pb.Node) error {
-	data, err := proto.Marshal(&value)
+func (cache *Cache) Put(ctx context.Context, nodeID storj.NodeID, value pb.Node) error {
+	// If we get a Node without an ID (i.e. bootstrap node)
+	// we don't want to add to the routing tbale
+	if nodeID.IsZero() {
+		return nil
+	}
+	if nodeID != value.Id {
+		return errors.New("invalid request")
+	}
+
+	// get existing node rep, or create a new statdb node with 0 rep
+	stats, err := cache.statDB.CreateEntryIfNotExists(ctx, nodeID)
 	if err != nil {
 		return err
 	}
 
-	return o.DB.Put(node.IDFromString(nodeID).Bytes(), data)
+	value.Reputation = &pb.NodeStats{
+		AuditSuccessRatio:  stats.AuditSuccessRatio,
+		AuditSuccessCount:  stats.AuditSuccessCount,
+		AuditCount:         stats.AuditCount,
+		UptimeRatio:        stats.UptimeRatio,
+		UptimeSuccessCount: stats.UptimeSuccessCount,
+		UptimeCount:        stats.UptimeCount,
+	}
+
+	return cache.db.Update(ctx, &value)
 }
 
-// Bootstrap walks the initialized network and populates the cache
-func (o *Cache) Bootstrap(ctx context.Context) error {
-	nodes, err := o.DHT.GetNodes(ctx, "", 1280)
-	if err != nil {
-		zap.Error(OverlayError.New("Error getting nodes from DHT: %v", err))
+// Delete will remove the node from the cache. Used when a node hard disconnects or fails
+// to pass a PING multiple times.
+func (cache *Cache) Delete(ctx context.Context, id storj.NodeID) error {
+	if id.IsZero() {
+		return ErrEmptyNode
 	}
-
-	for _, v := range nodes {
-		found, err := o.DHT.FindNode(ctx, node.IDFromString(v.Id))
-		if err != nil {
-			zap.Error(ErrNodeNotFound)
-		}
-
-		n, err := proto.Marshal(&found)
-		if err != nil {
-			return err
-		}
-
-		if err := o.DB.Put(node.IDFromString(found.Id).Bytes(), n); err != nil {
-			return err
-		}
-	}
-
-	return err
+	return cache.db.Delete(ctx, id)
 }
 
-// Refresh updates the cache db with the current DHT.
-// We currently do not penalize nodes that are unresponsive,
-// but should in the future.
-func (o *Cache) Refresh(ctx context.Context) error {
-	log.Print("starting cache refresh")
-	r, err := randomID()
+// ConnFailure implements the Transport Observer `ConnFailure` function
+func (cache *Cache) ConnFailure(ctx context.Context, node *pb.Node, failureError error) {
+	// TODO: Kademlia paper specifies 5 unsuccessful PINGs before removing the node
+	// from our routing table, but this is the cache so maybe we want to treat
+	// it differently.
+	_, err := cache.statDB.UpdateUptime(ctx, node.Id, false)
 	if err != nil {
-		return err
+		zap.L().Debug("error updating uptime for node in statDB", zap.Error(err))
 	}
-
-	rid := node.ID(r)
-	near, err := o.DHT.GetNodes(ctx, rid.String(), 128)
-	if err != nil {
-		return err
-	}
-
-	for _, node := range near {
-		pinged, err := o.DHT.Ping(ctx, *node)
-		if err != nil {
-			return err
-		}
-		err = o.DB.Put([]byte(pinged.Id), []byte(pinged.Address.Address))
-		if err != nil {
-			return err
-		}
-	}
-
-	// TODO: Kademlia hooks to do this automatically rather than at interval
-	nodes, err := o.DHT.GetNodes(ctx, "", 128)
-	if err != nil {
-		return err
-	}
-
-	for _, node := range nodes {
-		pinged, err := o.DHT.Ping(ctx, *node)
-		if err != nil {
-			zap.Error(ErrNodeNotFound)
-			return err
-		}
-		err = o.DB.Put([]byte(pinged.Id), []byte(pinged.Address.Address))
-		if err != nil {
-			return err
-		}
-
-	}
-
-	return err
 }
 
-// Walk iterates over each node in each bucket to traverse the network
-func (o *Cache) Walk(ctx context.Context) error {
-	// TODO: This should walk the cache, rather than be a duplicate of refresh
-	return nil
-}
-
-func randomID() ([]byte, error) {
-	result := make([]byte, 64)
-	_, err := rand.Read(result)
-	return result, err
+// ConnSuccess implements the Transport Observer `ConnSuccess` function
+func (cache *Cache) ConnSuccess(ctx context.Context, node *pb.Node) {
+	err := cache.Put(ctx, node.Id, *node)
+	if err != nil {
+		zap.L().Debug("error updating uptime for node in statDB", zap.Error(err))
+	}
+	_, err = cache.statDB.UpdateUptime(ctx, node.Id, true)
+	if err != nil {
+		zap.L().Debug("error updating statdDB with node connection info", zap.Error(err))
+	}
 }

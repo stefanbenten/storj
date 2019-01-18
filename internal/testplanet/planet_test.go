@@ -13,7 +13,7 @@ import (
 
 func TestBasic(t *testing.T) {
 	t.Log("New")
-	planet, err := testplanet.New(2, 4, 1)
+	planet, err := testplanet.New(t, 2, 4, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,12 +45,25 @@ func TestBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	message, err := client.SignedMessage()
+	message := client.SignedMessage()
+	t.Log(message)
+
+	nodeClient, err := planet.StorageNodes[0].NewNodeClient()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Log(message)
+	// ping a satellite
+	_, err = nodeClient.Ping(context.Background(), planet.Satellites[0].Local())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ping a storage node
+	_, err = nodeClient.Ping(context.Background(), planet.StorageNodes[1].Local())
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func BenchmarkCreate(b *testing.B) {
@@ -59,7 +72,7 @@ func BenchmarkCreate(b *testing.B) {
 		b.Run(strconv.Itoa(count), func(b *testing.B) {
 			ctx := context.Background()
 			for i := 0; i < b.N; i++ {
-				planet, err := testplanet.New(1, count, 1)
+				planet, err := testplanet.New(nil, 1, count, 1)
 				if err != nil {
 					b.Fatal(err)
 				}

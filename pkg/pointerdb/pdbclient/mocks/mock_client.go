@@ -6,8 +6,10 @@ package mock_pointerdb
 
 import (
 	context "context"
-	gomock "github.com/golang/mock/gomock"
 	reflect "reflect"
+
+	gomock "github.com/golang/mock/gomock"
+
 	pb "storj.io/storj/pkg/pb"
 	pdbclient "storj.io/storj/pkg/pointerdb/pdbclient"
 )
@@ -48,11 +50,13 @@ func (mr *MockClientMockRecorder) Delete(arg0, arg1 interface{}) *gomock.Call {
 }
 
 // Get mocks base method
-func (m *MockClient) Get(arg0 context.Context, arg1 string) (*pb.Pointer, error) {
+func (m *MockClient) Get(arg0 context.Context, arg1 string) (*pb.Pointer, []*pb.Node, *pb.PayerBandwidthAllocation, error) {
 	ret := m.ctrl.Call(m, "Get", arg0, arg1)
 	ret0, _ := ret[0].(*pb.Pointer)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
+	ret1, _ := ret[1].([]*pb.Node)
+	ret2, _ := ret[2].(*pb.PayerBandwidthAllocation)
+	ret3, _ := ret[3].(error)
+	return ret0, ret1, ret2, ret3
 }
 
 // Get indicates an expected call of Get
@@ -75,15 +79,16 @@ func (mr *MockClientMockRecorder) List(arg0, arg1, arg2, arg3, arg4, arg5, arg6 
 }
 
 // PayerBandwidthAllocation mocks base method
-func (m *MockClient) PayerBandwidthAllocation() *pb.PayerBandwidthAllocation {
-	ret := m.ctrl.Call(m, "PayerBandwidthAllocation")
+func (m *MockClient) PayerBandwidthAllocation(arg0 context.Context, arg1 pb.PayerBandwidthAllocation_Action) (*pb.PayerBandwidthAllocation, error) {
+	ret := m.ctrl.Call(m, "PayerBandwidthAllocation", arg0, arg1)
 	ret0, _ := ret[0].(*pb.PayerBandwidthAllocation)
-	return ret0
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // PayerBandwidthAllocation indicates an expected call of PayerBandwidthAllocation
-func (mr *MockClientMockRecorder) PayerBandwidthAllocation() *gomock.Call {
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PayerBandwidthAllocation", reflect.TypeOf((*MockClient)(nil).PayerBandwidthAllocation))
+func (mr *MockClientMockRecorder) PayerBandwidthAllocation(arg0, arg1 interface{}) *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PayerBandwidthAllocation", reflect.TypeOf((*MockClient)(nil).PayerBandwidthAllocation), arg0, arg1)
 }
 
 // Put mocks base method
@@ -99,11 +104,10 @@ func (mr *MockClientMockRecorder) Put(arg0, arg1, arg2 interface{}) *gomock.Call
 }
 
 // SignedMessage mocks base method
-func (m *MockClient) SignedMessage() (*pb.SignedMessage, error) {
+func (m *MockClient) SignedMessage() *pb.SignedMessage {
 	ret := m.ctrl.Call(m, "SignedMessage")
 	ret0, _ := ret[0].(*pb.SignedMessage)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
+	return ret0
 }
 
 // SignedMessage indicates an expected call of SignedMessage

@@ -49,16 +49,28 @@ lint: check-copyrights ## Analyze and find programs in source code
 .PHONY: check-copyrights
 check-copyrights: ## Check source files for copyright headers
 	@echo "Running ${@}"
-	@./scripts/check-for-header.sh
+	@go run ./scripts/check-copyright.go
 
 .PHONY: goimports-fix
 goimports-fix: ## Applies goimports to every go file (excluding vendored files)
-	goimports -w $$(find . -type f -name '*.go' -not -path "*/vendor/*")
+	goimports -w -local storj.io $$(find . -type f -name '*.go' -not -path "*/vendor/*")
+
+.PHONY: goimports-st
+goimports-st: ## Applies goimports to every go file in `git status` (ignores untracked files)
+	git status --porcelain -uno|grep .go|grep -v "^D"|sed -E 's,\w+\s+(.+->\s+)?,,g'|xargs -I {} goimports -w -local storj.io {}
 
 .PHONY: proto
 proto: ## Rebuild protobuf files
 	@echo "Running ${@}"
-	./scripts/build-protos.sh
+	go run scripts/protobuf.go install
+	go run scripts/protobuf.go generate
+
+##@ Simulator
+
+.PHONY: install-sim
+install-sim: ## install storj-sim
+	@echo "Running ${@}"
+	@go install -race -v storj.io/storj/cmd/storj-sim storj.io/storj/cmd/bootstrap storj.io/storj/cmd/satellite storj.io/storj/cmd/storagenode storj.io/storj/cmd/uplink storj.io/storj/cmd/gateway storj.io/storj/cmd/identity storj.io/storj/cmd/certificates
 
 ##@ Test
 
@@ -67,10 +79,15 @@ test: ## Run tests on source code (travis)
 	go test -race -v -cover -coverprofile=.coverprofile ./...
 	@echo done
 
-.PHONY: test-captplanet
-test-captplanet: ## Test source with captain planet (travis)
+.PHONY: test-sim
+test-sim: ## Test source with storj-sim (travis)
 	@echo "Running ${@}"
-	@./scripts/test-captplanet.sh
+	@./scripts/test-sim.sh
+
+.PHONY: test-certificate-signing
+test-certificate-signing: ## Test certificate signing service and storagenode setup (travis)
+	@echo "Running ${@}"
+	@./scripts/test-certificate-signing.sh
 
 .PHONY: test-docker
 test-docker: ## Run tests in Docker
@@ -79,29 +96,34 @@ test-docker: ## Run tests in Docker
 
 .PHONY: all-in-one
 all-in-one: ## Deploy docker images with one storagenode locally
-	if [ -z "${VERSION}" ]; then \
-		$(MAKE) images -j 3 \
-		&& export VERSION="${TAG}"; \
-	fi \
-	&& docker-compose up -d storagenode \
-	&& scripts/fix-mock-overlay \
-	&& docker-compose up storagenode satellite uplink
+	export VERSION="${TAG}${CUSTOMTAG}" \
+	&& $(MAKE) satellite-image storagenode-image gateway-image \
+	&& docker-compose up --scale storagenode=1 satellite gateway
+
+.PHONY: test-all-in-one
+test-all-in-one: ## Test docker images locally
+	export VERSION="${TAG}${CUSTOMTAG}" \
+	&& $(MAKE) satellite-image storagenode-image gateway-image \
+	&& ./scripts/test-aio.sh
 
 ##@ Build
 
 .PHONY: images
-images: satellite-image storagenode-image uplink-image ## Build satellite, storagenode, and uplink Docker images
+images: satellite-image storagenode-image uplink-image gateway-image ## Build gateway, satellite, storagenode, and uplink Docker images
 	echo Built version: ${TAG}
 
+.PHONY: gateway-image
+gateway-image: ## Build gateway Docker image
+	${DOCKER_BUILD} --pull=true -t storjlabs/gateway:${TAG}${CUSTOMTAG} -f cmd/gateway/Dockerfile .
 .PHONY: satellite-image
 satellite-image: ## Build satellite Docker image
-	${DOCKER_BUILD} -t storjlabs/satellite:${TAG}${CUSTOMTAG} -f cmd/satellite/Dockerfile .
+	${DOCKER_BUILD} --pull=true -t storjlabs/satellite:${TAG}${CUSTOMTAG} -f cmd/satellite/Dockerfile .
 .PHONY: storagenode-image
 storagenode-image: ## Build storagenode Docker image
-	${DOCKER_BUILD} -t storjlabs/storagenode:${TAG}${CUSTOMTAG} -f cmd/storagenode/Dockerfile .
+	${DOCKER_BUILD} --pull=true -t storjlabs/storagenode:${TAG}${CUSTOMTAG} -f cmd/storagenode/Dockerfile .
 .PHONY: uplink-image
 uplink-image: ## Build uplink Docker image
-	${DOCKER_BUILD} -t storjlabs/uplink:${TAG}${CUSTOMTAG} -f cmd/uplink/Dockerfile .
+	${DOCKER_BUILD} --pull=true -t storjlabs/uplink:${TAG}${CUSTOMTAG} -f cmd/uplink/Dockerfile .
 
 .PHONY: binary
 binary: CUSTOMTAG = -${GOOS}-${GOARCH}
@@ -111,14 +133,14 @@ binary:
 	mkdir -p release/${TAG}
 	rm -f cmd/${COMPONENT}/resource.syso
 	if [ "${GOARCH}" = "amd64" ]; then sixtyfour="-64"; fi; \
-	goversioninfo $$sixtyfour -o cmd/${COMPONENT}/resource.syso \
+	[ "${GOARCH}" = "amd64" ] && goversioninfo $$sixtyfour -o cmd/${COMPONENT}/resource.syso \
 	-original-name ${COMPONENT}_${GOOS}_${GOARCH}${FILEEXT} \
 	-description "${COMPONENT} program for Storj" \
 	-product-ver-build 2 -ver-build 2 \
 	-product-version "alpha2" \
 	resources/versioninfo.json || echo "goversioninfo is not installed, metadata will not be created"
 	tar -c . | docker run --rm -i -e TAR=1 -e GO111MODULE=on \
-	-e GOOS=${GOOS} -e GOARCH=${GOARCH} -e CGO_ENABLED=1 \
+	-e GOOS=${GOOS} -e GOARCH=${GOARCH} -e GOARM=6 -e CGO_ENABLED=1 \
 	-w /go/src/storj.io/storj -e GOPROXY storjlabs/golang \
 	-o app storj.io/storj/cmd/${COMPONENT} \
 	| tar -O -x ./app > release/${TAG}/$(COMPONENT)_${GOOS}_${GOARCH}${FILEEXT}
@@ -128,6 +150,9 @@ binary:
 	cd release/${TAG}; zip ${COMPONENT}_${GOOS}_${GOARCH}.zip ${COMPONENT}_${GOOS}_${GOARCH}${FILEEXT}
 	rm -f release/${TAG}/${COMPONENT}_${GOOS}_${GOARCH}${FILEEXT}
 
+.PHONY: gateway_%
+gateway_%:
+	GOOS=$(word 2, $(subst _, ,$@)) GOARCH=$(word 3, $(subst _, ,$@)) COMPONENT=gateway $(MAKE) binary
 .PHONY: satellite_%
 satellite_%:
 	GOOS=$(word 2, $(subst _, ,$@)) GOARCH=$(word 3, $(subst _, ,$@)) COMPONENT=satellite $(MAKE) binary
@@ -138,11 +163,11 @@ storagenode_%:
 uplink_%:
 	GOOS=$(word 2, $(subst _, ,$@)) GOARCH=$(word 3, $(subst _, ,$@)) COMPONENT=uplink $(MAKE) binary
 
-COMPONENTLIST := uplink satellite storagenode
-OSARCHLIST    := linux_amd64 windows_amd64 darwin_amd64
+COMPONENTLIST := gateway satellite storagenode uplink
+OSARCHLIST    := darwin_amd64 linux_amd64 linux_arm windows_amd64
 BINARIES      := $(foreach C,$(COMPONENTLIST),$(foreach O,$(OSARCHLIST),$C_$O))
 .PHONY: binaries
-binaries: ${BINARIES} ## Build uplink, satellite, and storagenode binaries (jenkins)
+binaries: ${BINARIES} ## Build gateway, satellite, storagenode, and uplink binaries (jenkins)
 
 ##@ Deploy
 
@@ -164,6 +189,9 @@ push-images: ## Push Docker images to Docker Hub (jenkins)
 	docker tag storjlabs/uplink:${TAG} storjlabs/uplink:latest
 	docker push storjlabs/uplink:${TAG}
 	docker push storjlabs/uplink:latest
+	docker tag storjlabs/gateway:${TAG} storjlabs/gateway:latest
+	docker push storjlabs/gateway:${TAG}
+	docker push storjlabs/gateway:latest
 
 .PHONY: binaries-upload
 binaries-upload: ## Upload binaries to Google Storage (jenkins)
@@ -181,11 +209,13 @@ binaries-clean: ## Remove all local release binaries (jenkins)
 .PHONY: clean-images
 ifeq (${BRANCH},master)
 clean-images: ## Remove Docker images from local engine
+	-docker rmi storjlabs/gateway:${TAG} storjlabs/gateway:latest
 	-docker rmi storjlabs/satellite:${TAG} storjlabs/satellite:latest
 	-docker rmi storjlabs/storagenode:${TAG} storjlabs/storagenode:latest
 	-docker rmi storjlabs/uplink:${TAG} storjlabs/uplink:latest
 else
 clean-images:
+	-docker rmi storjlabs/gateway:${TAG}
 	-docker rmi storjlabs/satellite:${TAG}
 	-docker rmi storjlabs/storagenode:${TAG}
 	-docker rmi storjlabs/uplink:${TAG}

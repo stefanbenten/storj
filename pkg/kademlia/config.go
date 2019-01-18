@@ -8,6 +8,7 @@ import (
 	"flag"
 
 	"github.com/zeebo/errs"
+	"go.uber.org/zap"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
 	"storj.io/storj/pkg/node"
@@ -22,14 +23,9 @@ var (
 	mon   = monkit.Package()
 )
 
-const (
-	defaultAlpha = 5
-)
-
 var (
-	// TODO: replace these with constants after tuning
-	flagBucketSize           = flag.Int("kademlia-bucket-size", 20, "Size of each Kademlia bucket")
-	flagReplacementCacheSize = flag.Int("kademlia-replacement-cache-size", 5, "Size of Kademlia replacement cache")
+	flagBucketSize           = flag.Int("kademlia.bucket-size", 20, "size of each Kademlia bucket")
+	flagReplacementCacheSize = flag.Int("kademlia.replacement-cache-size", 5, "size of Kademlia replacement cache")
 )
 
 //CtxKey Used as kademlia key
@@ -39,45 +35,96 @@ const (
 	ctxKeyKad CtxKey = iota
 )
 
+// OperatorConfig defines properties related to storage node operator metadata
+type OperatorConfig struct {
+	Email  string `user:"true" help:"operator email address" default:""`
+	Wallet string `user:"true" help:"operator wallet adress" default:""`
+}
+
 // Config defines all of the things that are needed to start up Kademlia
 // server endpoints (and not necessarily client code).
 type Config struct {
-	BootstrapAddr string `help:"the kademlia node to bootstrap against" default:"bootstrap-dev.storj.io:8080"`
-	DBPath        string `help:"the path for our db services to be created on" default:"$CONFDIR/kademlia"`
-	// TODO(jt): remove this! kademlia should just use the grpc server
-	TODOListenAddr string `help:"the host/port for kademlia to listen on. TODO(jt): this should be removed!" default:"127.0.0.1:7776"`
-	Alpha          int    `help:"alpha is a system wide concurrency parameter." default:"5"`
+	BootstrapAddr   string `help:"the Kademlia node to bootstrap against" default:"127.0.0.1:7778"`
+	DBPath          string `help:"the path for storage node db services to be created on" default:"$CONFDIR/kademlia"`
+	Alpha           int    `help:"alpha is a system wide concurrency parameter" default:"5"`
+	ExternalAddress string `user:"true" help:"the public address of the Kademlia node, useful for nodes behind NAT" default:""`
+	Operator        OperatorConfig
 }
 
-// Run implements provider.Responsibility
-func (c Config) Run(ctx context.Context, server *provider.Provider) (
-	err error) {
+// StorageNodeConfig is a Config that implements provider.Responsibility as
+// a storage node
+type StorageNodeConfig Config
 
+// Run implements provider.Responsibility
+func (c StorageNodeConfig) Run(ctx context.Context, server *provider.Provider) error {
+	return Config(c).Run(ctx, server, pb.NodeType_STORAGE)
+}
+
+// BootstrapConfig is a Config that implements provider.Responsibility as
+// a bootstrap server
+type BootstrapConfig Config
+
+// Run implements provider.Responsibility
+func (c BootstrapConfig) Run(ctx context.Context, server *provider.Provider) error {
+	return Config(c).Run(ctx, server, pb.NodeType_BOOTSTRAP)
+}
+
+// SatelliteConfig is a Config that implements provider.Responsibility as
+// a satellite
+type SatelliteConfig Config
+
+// Run implements provider.Responsibility
+func (c SatelliteConfig) Run(ctx context.Context, server *provider.Provider) error {
+	return Config(c).Run(ctx, server, pb.NodeType_SATELLITE)
+}
+
+// Run does not implement provider.Responsibility. Please use a specific
+// SatelliteConfig or StorageNodeConfig
+func (c Config) Run(ctx context.Context, server *provider.Provider,
+	nodeType pb.NodeType) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	// TODO(coyle): I'm thinking we just remove  this function and grab from the config.
+	// TODO(coyle): I'm thinking we just remove this function and grab from the config.
+	zap.S().Debugf("kademlia bootstrap node: %q", c.BootstrapAddr)
 	in, err := GetIntroNode(c.BootstrapAddr)
 	if err != nil {
 		return err
 	}
 
-	// TODO(jt): kademlia should register on server.GRPC() instead of listening
-	// itself
-	in.Id = "foo"
-	kad, err := NewKademlia(server.Identity().ID, []pb.Node{*in}, c.TODOListenAddr, server.Identity(), c.DBPath, c.Alpha)
+	metadata := &pb.NodeMetadata{
+		Email:  c.Operator.Email,
+		Wallet: c.Operator.Wallet,
+	}
+
+	addr := server.Addr().String()
+	if c.ExternalAddress != "" {
+		addr = c.ExternalAddress
+	}
+
+	logger := zap.L()
+	kad, err := NewKademlia(logger, nodeType, []pb.Node{*in}, addr, metadata, server.Identity(), c.DBPath, c.Alpha)
 	if err != nil {
 		return err
 	}
+	kad.StartRefresh(ctx)
 	defer func() { err = utils.CombineErrors(err, kad.Disconnect()) }()
 
-	mn := node.NewServer(kad)
-	pb.RegisterNodesServer(server.GRPC(), mn)
+	go func() {
+		if err = kad.Bootstrap(ctx); err != nil {
+			logger.Error("Failed to bootstrap Kademlia", zap.Any("ID", server.Identity().ID))
+		} else {
+			logger.Sugar().Infof("Successfully connected to Kademlia bootstrap node %s", c.BootstrapAddr)
+		}
+	}()
 
-	// TODO(jt): Bootstrap should probably be blocking and we should kick it off
-	// in a goroutine here
-	if err = kad.Bootstrap(ctx); err != nil {
-		return err
-	}
+	pb.RegisterNodesServer(server.GRPC(), node.NewServer(logger, kad))
+
+	zap.S().Infof("Kademlia external address: %s", addr)
+
+	zap.S().Warn("Once the Peer refactor is done, the kad inspector needs to be registered on a " +
+		"gRPC server that only listens on localhost")
+	// TODO: register on a private rpc server
+	pb.RegisterKadInspectorServer(server.GRPC(), NewInspector(kad, server.Identity()))
 
 	return server.Run(context.WithValue(ctx, ctxKeyKad, kad))
 }

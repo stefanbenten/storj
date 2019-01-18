@@ -10,8 +10,7 @@ import (
 
 	"storj.io/storj/internal/fpath"
 	"storj.io/storj/pkg/process"
-	"storj.io/storj/pkg/storage/meta"
-	"storj.io/storj/storage"
+	"storj.io/storj/pkg/storj"
 )
 
 func init() {
@@ -42,36 +41,23 @@ func deleteBucket(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Nested buckets not supported, use format sj://bucket/")
 	}
 
-	bs, err := cfg.BucketStore(ctx)
+	metainfo, _, err := cfg.Metainfo(ctx)
 	if err != nil {
 		return err
 	}
 
-	_, err = bs.Get(ctx, dst.Bucket())
+	list, err := metainfo.ListObjects(ctx, dst.Bucket(), storj.ListOptions{Direction: storj.After, Recursive: true, Limit: 1})
 	if err != nil {
-		if storage.ErrKeyNotFound.Has(err) {
-			return fmt.Errorf("Bucket not found: %s", dst.Bucket())
-		}
-		return err
+		return convertError(err, dst)
 	}
 
-	o, err := bs.GetObjectStore(ctx, dst.Bucket())
-	if err != nil {
-		return err
-	}
-
-	items, _, err := o.List(ctx, "", "", "", true, 1, meta.None)
-	if err != nil {
-		return err
-	}
-
-	if len(items) > 0 {
+	if len(list.Items) > 0 {
 		return fmt.Errorf("Bucket not empty: %s", dst.Bucket())
 	}
 
-	err = bs.Delete(ctx, dst.Bucket())
+	err = metainfo.DeleteBucket(ctx, dst.Bucket())
 	if err != nil {
-		return err
+		return convertError(err, dst)
 	}
 
 	fmt.Printf("Bucket %s deleted\n", dst.Bucket())

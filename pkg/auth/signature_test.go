@@ -11,12 +11,12 @@ import (
 	"github.com/gtank/cryptopasta"
 	"github.com/stretchr/testify/assert"
 
-	"storj.io/storj/pkg/provider"
+	"storj.io/storj/internal/testidentity"
 )
 
 func TestGenerateSignature(t *testing.T) {
 	ctx := context.Background()
-	ca, err := provider.NewTestCA(ctx)
+	ca, err := testidentity.NewTestCA(ctx)
 	assert.NoError(t, err)
 	identity, err := ca.NewIdentity()
 	assert.NoError(t, err)
@@ -41,7 +41,7 @@ func TestGenerateSignature(t *testing.T) {
 
 func TestSignedMessageVerifier(t *testing.T) {
 	ctx := context.Background()
-	ca, err := provider.NewTestCA(ctx)
+	ca, err := testidentity.NewTestCA(ctx)
 	assert.NoError(t, err)
 	identity, err := ca.NewIdentity()
 	assert.NoError(t, err)
@@ -49,8 +49,7 @@ func TestSignedMessageVerifier(t *testing.T) {
 	signature, err := GenerateSignature(identity.ID.Bytes(), identity)
 	assert.NoError(t, err)
 
-	peerIdentity := &provider.PeerIdentity{ID: identity.ID, Leaf: identity.Leaf}
-	signedMessage, err := NewSignedMessage(signature, peerIdentity)
+	signedMessage, err := NewSignedMessage(signature, identity)
 	assert.NoError(t, err)
 
 	for _, tt := range []struct {

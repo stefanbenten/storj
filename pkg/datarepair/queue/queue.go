@@ -4,58 +4,44 @@
 package queue
 
 import (
-	"encoding/binary"
-	"math/rand"
-	"sync"
-	"time"
+	"context"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
+	"go.uber.org/zap"
 
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/storage"
 )
 
-// RepairQueue is the interface for the data repair queue
+// RepairQueue implements queueing for segments that need repairing.
 type RepairQueue interface {
-	Enqueue(qi *pb.InjuredSegment) error
-	Dequeue() (pb.InjuredSegment, error)
+	// Enqueue adds an injured segment.
+	Enqueue(ctx context.Context, qi *pb.InjuredSegment) error
+	// Dequeue removes an injured segment.
+	Dequeue(ctx context.Context) (pb.InjuredSegment, error)
+	// Peekqueue lists limit amount of injured segments.
+	Peekqueue(ctx context.Context, limit int) ([]pb.InjuredSegment, error)
 }
 
 // Queue implements the RepairQueue interface
 type Queue struct {
-	mu sync.Mutex
-	db storage.KeyValueStore
+	db storage.Queue
 }
 
 // NewQueue returns a pointer to a new Queue instance with an initialized connection to Redis
-func NewQueue(client storage.KeyValueStore) *Queue {
-	return &Queue{
-		mu: sync.Mutex{},
-		db: client,
-	}
+func NewQueue(client storage.Queue) *Queue {
+	zap.L().Info("Initializing new data repair queue")
+	return &Queue{db: client}
 }
 
 // Enqueue adds a repair segment to the queue
-func (q *Queue) Enqueue(qi *pb.InjuredSegment) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	const dateSize = 8
-	dateTime := make([]byte, dateSize)
-	// TODO: this can cause conflicts when time is unstable or running on multiple computers
-	// Append random 4 byte token to account for time conflicts
-	binary.BigEndian.PutUint64(dateTime, uint64(time.Now().UnixNano()))
-	const tokenSize = 4
-	token := make([]byte, tokenSize)
-	_, err := rand.Read(token)
-	if err != nil {
-		return Error.New("error creating random token %s", err)
-	}
-	dateTime = append(dateTime, token...)
+func (q *Queue) Enqueue(ctx context.Context, qi *pb.InjuredSegment) error {
 	val, err := proto.Marshal(qi)
 	if err != nil {
 		return Error.New("error marshalling injured seg %s", err)
 	}
-	err = q.db.Put(dateTime, val)
+
+	err = q.db.Enqueue(val)
 	if err != nil {
 		return Error.New("error adding injured seg to queue %s", err)
 	}
@@ -63,28 +49,38 @@ func (q *Queue) Enqueue(qi *pb.InjuredSegment) error {
 }
 
 // Dequeue returns the next repair segement and removes it from the queue
-func (q *Queue) Dequeue() (pb.InjuredSegment, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	items, _, err := storage.ListV2(q.db, storage.ListOptions{IncludeValue: true, Limit: 1, Recursive: true})
+func (q *Queue) Dequeue(ctx context.Context) (pb.InjuredSegment, error) {
+	val, err := q.db.Dequeue()
 	if err != nil {
-		return pb.InjuredSegment{}, Error.New("error getting first key %s", err)
+		if storage.ErrEmptyQueue.Has(err) {
+			return pb.InjuredSegment{}, err
+		}
+		return pb.InjuredSegment{}, Error.New("error obtaining item from repair queue %s", err)
 	}
-	if len(items) == 0 {
-		return pb.InjuredSegment{}, Error.New("empty database")
-	}
-	key := items[0].Key
-	val := items[0].Value
-
 	seg := &pb.InjuredSegment{}
 	err = proto.Unmarshal(val, seg)
 	if err != nil {
 		return pb.InjuredSegment{}, Error.New("error unmarshalling segment %s", err)
 	}
-	err = q.db.Delete(key)
-	if err != nil {
-		return *seg, Error.New("error removing injured seg %s", err)
-	}
 	return *seg, nil
+}
+
+// Peekqueue returns upto 'limit' of the entries from the repair queue
+func (q *Queue) Peekqueue(ctx context.Context, limit int) ([]pb.InjuredSegment, error) {
+	if limit < 0 || limit > storage.LookupLimit {
+		limit = storage.LookupLimit
+	}
+	result, err := q.db.Peekqueue(limit)
+	if err != nil {
+		return []pb.InjuredSegment{}, Error.New("error peeking into repair queue %s", err)
+	}
+	segs := make([]pb.InjuredSegment, 0)
+	for _, v := range result {
+		seg := &pb.InjuredSegment{}
+		if err = proto.Unmarshal(v, seg); err != nil {
+			return nil, err
+		}
+		segs = append(segs, *seg)
+	}
+	return segs, nil
 }

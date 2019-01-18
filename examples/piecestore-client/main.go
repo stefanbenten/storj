@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"fmt"
 	"io"
 	"log"
@@ -16,12 +15,11 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/spf13/cobra"
 	"github.com/zeebo/errs"
-	"google.golang.org/grpc"
 
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/piecestore/rpc/client"
+	"storj.io/storj/pkg/piecestore/psclient"
 	"storj.io/storj/pkg/provider"
+	"storj.io/storj/pkg/transport"
 )
 
 var ctx = context.Background()
@@ -30,33 +28,36 @@ var argError = errs.Class("argError")
 func main() {
 	cobra.EnableCommandSorting = false
 
-	ca, err := provider.NewTestCA(ctx)
+	clientIdent, err := provider.NewFullIdentity(ctx, 12, 4)
 	if err != nil {
 		log.Fatal(err)
 	}
-	identity, err := ca.NewIdentity()
-	if err != nil {
-		log.Fatal(err)
-	}
-	identOpt, err := identity.DialOption()
+
+	serverIdent, err := provider.NewFullIdentity(ctx, 12, 4)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Set up connection with rpc server
-	var conn *grpc.ClientConn
-	conn, err = grpc.Dial(":7777", identOpt)
-	if err != nil {
-		log.Fatalf("did not connect: %s", err)
+	n := &pb.Node{
+		Address: &pb.NodeAddress{
+			Address:   ":7777",
+			Transport: 0,
+		},
+		Id:   serverIdent.ID,
+		Type: pb.NodeType_STORAGE,
 	}
-	defer printError(conn.Close)
-
-	nodeID := node.IDFromString("test-node-id-1234567")
-
-	psClient, err := client.NewPSClient(conn, nodeID, 1024*32, identity.Key.(*ecdsa.PrivateKey))
+	tc := transport.NewClient(clientIdent)
+	// create a new liteclient for dashboard on localhost port 7777
+	liteClient, err := psclient.NewLiteClient(ctx, ":7777")
 	if err != nil {
-		log.Fatalf("could not initialize PSClient: %s", err)
+		log.Fatalf("could not initialize lite client: %s", err)
 	}
+	psClient, err := psclient.NewPSClient(ctx, tc, n, 0)
+	if err != nil {
+		log.Fatalf("could not initialize Client: %s", err)
+	}
+	defer printError(psClient.Close)
 
 	root := &cobra.Command{
 		Use:   "piecestore-client",
@@ -87,24 +88,30 @@ func main() {
 				return argError.New(fmt.Sprintf("path (%s) is a directory, not a file", inputfile))
 			}
 
+			satelliteIdent, err := provider.NewFullIdentity(ctx, 12, 4)
+			if err != nil {
+				return err
+			}
+
 			var length = fileInfo.Size()
 			var ttl = time.Now().Add(24 * time.Hour)
 
 			// Created a section reader so that we can concurrently retrieve the same file.
 			dataSection := io.NewSectionReader(file, 0, length)
 
-			id := client.NewPieceID()
+			id := psclient.NewPieceID()
 
 			allocationData := &pb.PayerBandwidthAllocation_Data{
-        		SatelliteId: []byte("OhHeyThisIsAnUnrealFakeSatellite"),
-				Action: pb.PayerBandwidthAllocation_PUT,
+				SatelliteId:    satelliteIdent.ID,
+				Action:         pb.PayerBandwidthAllocation_PUT,
+				CreatedUnixSec: time.Now().Unix(),
 			}
-		
+
 			serializedAllocation, err := proto.Marshal(allocationData)
 			if err != nil {
 				return err
 			}
-		
+
 			pba := &pb.PayerBandwidthAllocation{
 				Data: serializedAllocation,
 			}
@@ -149,7 +156,7 @@ func main() {
 			}
 			defer printError(dataFile.Close)
 
-			pieceInfo, err := psClient.Meta(context.Background(), client.PieceID(id))
+			pieceInfo, err := psClient.Meta(context.Background(), psclient.PieceID(id))
 			if err != nil {
 				errRemove := os.Remove(outputDir)
 				if errRemove != nil {
@@ -158,21 +165,27 @@ func main() {
 				return err
 			}
 
-			allocationData := &pb.PayerBandwidthAllocation_Data{
-        		SatelliteId: []byte("OhHeyThisIsAnUnrealFakeSatellite"),
-				Action: pb.PayerBandwidthAllocation_GET,
+			satelliteIdent, err := provider.NewFullIdentity(ctx, 12, 4)
+			if err != nil {
+				return err
 			}
-		
+
+			allocationData := &pb.PayerBandwidthAllocation_Data{
+				SatelliteId:    satelliteIdent.ID,
+				Action:         pb.PayerBandwidthAllocation_GET,
+				CreatedUnixSec: time.Now().Unix(),
+			}
+
 			serializedAllocation, err := proto.Marshal(allocationData)
 			if err != nil {
 				return err
 			}
-		
+
 			pba := &pb.PayerBandwidthAllocation{
 				Data: serializedAllocation,
 			}
 
-			rr, err := psClient.Get(ctx, client.PieceID(id), pieceInfo.Size, pba, nil)
+			rr, err := psClient.Get(ctx, psclient.PieceID(id), pieceInfo.PieceSize, pba, nil)
 			if err != nil {
 				fmt.Printf("Failed to retrieve file of id: %s\n", id)
 				errRemove := os.Remove(outputDir)
@@ -182,7 +195,7 @@ func main() {
 				return err
 			}
 
-			reader, err := rr.Range(ctx, 0, pieceInfo.Size)
+			reader, err := rr.Range(ctx, 0, pieceInfo.PieceSize)
 			if err != nil {
 				fmt.Printf("Failed to retrieve file of id: %s\n", id)
 				errRemove := os.Remove(outputDir)
@@ -214,7 +227,7 @@ func main() {
 		Aliases: []string{"x"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := args[0]
-			return psClient.Delete(context.Background(), client.PieceID(id), nil)
+			return psClient.Delete(context.Background(), psclient.PieceID(id), nil)
 		},
 	})
 
@@ -224,7 +237,7 @@ func main() {
 		Short:   "Retrieve statistics",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var summary *pb.StatSummary
-			summary, err := psClient.Stats(context.Background())
+			summary, err := liteClient.Stats(context.Background())
 			if err != nil {
 				return err
 			}

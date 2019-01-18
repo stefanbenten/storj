@@ -11,14 +11,14 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	monkit "gopkg.in/spacemonkeygo/monkit.v2"
+	"gopkg.in/spacemonkeygo/monkit.v2"
 
 	"storj.io/storj/pkg/eestream"
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/piecestore/rpc/client"
+	"storj.io/storj/pkg/piecestore/psclient"
 	"storj.io/storj/pkg/provider"
 	"storj.io/storj/pkg/ranger"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/transport"
 	"storj.io/storj/pkg/utils"
 )
@@ -28,56 +28,53 @@ var mon = monkit.Package()
 // Client defines an interface for storing erasure coded data to piece store nodes
 type Client interface {
 	Put(ctx context.Context, nodes []*pb.Node, rs eestream.RedundancyStrategy,
-		pieceID client.PieceID, data io.Reader, expiration time.Time, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (successfulNodes []*pb.Node, err error)
+		pieceID psclient.PieceID, data io.Reader, expiration time.Time, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (successfulNodes []*pb.Node, err error)
 	Get(ctx context.Context, nodes []*pb.Node, es eestream.ErasureScheme,
-		pieceID client.PieceID, size int64, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (ranger.Ranger, error)
-	Delete(ctx context.Context, nodes []*pb.Node, pieceID client.PieceID, authorization *pb.SignedMessage) error
+		pieceID psclient.PieceID, size int64, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (ranger.Ranger, error)
+	Delete(ctx context.Context, nodes []*pb.Node, pieceID psclient.PieceID, authorization *pb.SignedMessage) error
 }
 
-type dialer interface {
-	dial(ctx context.Context, node *pb.Node) (ps client.PSClient, err error)
-}
-
-type defaultDialer struct {
-	transport transport.Client
-	identity  *provider.FullIdentity
-}
-
-func (dialer *defaultDialer) dial(ctx context.Context, storageNode *pb.Node) (ps client.PSClient, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	conn, err := dialer.transport.DialNode(ctx, storageNode)
-	if err != nil {
-		return nil, err
-	}
-
-	return client.NewPSClient(conn, node.IDFromString(storageNode.GetId()), 0, dialer.identity.Key)
-}
+type psClientFunc func(context.Context, transport.Client, *pb.Node, int) (psclient.Client, error)
+type psClientHelper func(context.Context, *pb.Node) (psclient.Client, error)
 
 type ecClient struct {
-	d   dialer
-	mbm int
+	transport       transport.Client
+	memoryLimit     int
+	newPSClientFunc psClientFunc
 }
 
-// NewClient from the given TransportClient and max buffer memory
-func NewClient(identity *provider.FullIdentity, transport transport.Client, mbm int) Client {
-	d := defaultDialer{identity: identity, transport: transport}
-	return &ecClient{d: &d, mbm: mbm}
+// NewClient from the given identity and max buffer memory
+func NewClient(identity *provider.FullIdentity, memoryLimit int) Client {
+	tc := transport.NewClient(identity)
+	return &ecClient{
+		transport:       tc,
+		memoryLimit:     memoryLimit,
+		newPSClientFunc: psclient.NewPSClient,
+	}
+}
+
+func (ec *ecClient) newPSClient(ctx context.Context, n *pb.Node) (psclient.Client, error) {
+	n.Type.DPanicOnInvalid("new ps client")
+	return ec.newPSClientFunc(ctx, ec.transport, n, 0)
 }
 
 func (ec *ecClient) Put(ctx context.Context, nodes []*pb.Node, rs eestream.RedundancyStrategy,
-	pieceID client.PieceID, data io.Reader, expiration time.Time, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (successfulNodes []*pb.Node, err error) {
+	pieceID psclient.PieceID, data io.Reader, expiration time.Time, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (successfulNodes []*pb.Node, err error) {
 	defer mon.Task()(&ctx)(&err)
-
 	if len(nodes) != rs.TotalCount() {
-		return nil, Error.New("number of nodes (%d) do not match total count (%d) of erasure scheme", len(nodes), rs.TotalCount())
+		return nil, Error.New("size of nodes slice (%d) does not match total count (%d) of erasure scheme", len(nodes), rs.TotalCount())
 	}
+
+	if nonNilCount(nodes) < rs.RepairThreshold() {
+		return nil, Error.New("number of non-nil nodes (%d) is less than repair threshold (%d) of erasure scheme", nonNilCount(nodes), rs.RepairThreshold())
+	}
+
 	if !unique(nodes) {
 		return nil, Error.New("duplicated nodes are not allowed")
 	}
 
 	padded := eestream.PadReader(ioutil.NopCloser(data), rs.StripeSize())
-	readers, err := eestream.EncodeReader(ctx, padded, rs, ec.mbm)
+	readers, err := eestream.EncodeReader(ctx, padded, rs, ec.memoryLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -90,23 +87,27 @@ func (ec *ecClient) Put(ctx context.Context, nodes []*pb.Node, rs eestream.Redun
 
 	for i, n := range nodes {
 
+		if n != nil {
+			n.Type.DPanicOnInvalid("ec client Put")
+		}
+
 		go func(i int, n *pb.Node) {
 			if n == nil {
 				_, err := io.Copy(ioutil.Discard, readers[i])
 				infos <- info{i: i, err: err}
 				return
 			}
-			derivedPieceID, err := pieceID.Derive([]byte(n.GetId()))
+			derivedPieceID, err := pieceID.Derive(n.Id.Bytes())
 
 			if err != nil {
 				zap.S().Errorf("Failed deriving piece id for %s: %v", pieceID, err)
 				infos <- info{i: i, err: err}
 				return
 			}
-			ps, err := ec.d.dial(ctx, n)
+			ps, err := ec.newPSClient(ctx, n)
 			if err != nil {
 				zap.S().Errorf("Failed dialing for putting piece %s -> %s to node %s: %v",
-					pieceID, derivedPieceID, n.GetId(), err)
+					pieceID, derivedPieceID, n.Id, err)
 				infos <- info{i: i, err: err}
 				return
 			}
@@ -117,8 +118,12 @@ func (ec *ecClient) Put(ctx context.Context, nodes []*pb.Node, rs eestream.Redun
 			// io.ErrUnexpectedEOF means the piece upload was interrupted due to slow connection.
 			// No error logging for this case.
 			if err != nil && err != io.ErrUnexpectedEOF {
-				zap.S().Errorf("Failed putting piece %s -> %s to node %s: %v",
-					pieceID, derivedPieceID, n.GetId(), err)
+				nodeAddress := "nil"
+				if n.Address != nil {
+					nodeAddress = n.Address.Address
+				}
+				zap.S().Errorf("Failed putting piece %s -> %s to node %s (%+v): %v",
+					pieceID, derivedPieceID, n.Id, nodeAddress, err)
 			}
 			infos <- info{i: i, err: err}
 		}(i, n)
@@ -154,12 +159,15 @@ func (ec *ecClient) Put(ctx context.Context, nodes []*pb.Node, rs eestream.Redun
 }
 
 func (ec *ecClient) Get(ctx context.Context, nodes []*pb.Node, es eestream.ErasureScheme,
-	pieceID client.PieceID, size int64, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (rr ranger.Ranger, err error) {
+	pieceID psclient.PieceID, size int64, pba *pb.PayerBandwidthAllocation, authorization *pb.SignedMessage) (rr ranger.Ranger, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	validNodeCount := validCount(nodes)
-	if validNodeCount < es.RequiredCount() {
-		return nil, Error.New("number of nodes (%v) do not match minimum required count (%v) of erasure scheme", len(nodes), es.RequiredCount())
+	if len(nodes) != es.TotalCount() {
+		return nil, Error.New("size of nodes slice (%d) does not match total count (%d) of erasure scheme", len(nodes), es.TotalCount())
+	}
+
+	if nonNilCount(nodes) < es.RequiredCount() {
+		return nil, Error.New("number of non-nil nodes (%d) is less than required count (%d) of erasure scheme", nonNilCount(nodes), es.RequiredCount())
 	}
 
 	paddedSize := calcPadded(size, es.StripeSize())
@@ -174,13 +182,18 @@ func (ec *ecClient) Get(ctx context.Context, nodes []*pb.Node, es eestream.Erasu
 	ch := make(chan rangerInfo, len(nodes))
 
 	for i, n := range nodes {
+
+		if n != nil {
+			n.Type.DPanicOnInvalid("ec client Get")
+		}
+
 		if n == nil {
 			ch <- rangerInfo{i: i, rr: nil, err: nil}
 			continue
 		}
 
 		go func(i int, n *pb.Node) {
-			derivedPieceID, err := pieceID.Derive([]byte(n.GetId()))
+			derivedPieceID, err := pieceID.Derive(n.Id.Bytes())
 			if err != nil {
 				zap.S().Errorf("Failed deriving piece id for %s: %v", pieceID, err)
 				ch <- rangerInfo{i: i, rr: nil, err: err}
@@ -188,12 +201,12 @@ func (ec *ecClient) Get(ctx context.Context, nodes []*pb.Node, es eestream.Erasu
 			}
 
 			rr := &lazyPieceRanger{
-				dialer:        ec.d,
-				node:          n,
-				id:            derivedPieceID,
-				size:          pieceSize,
-				pba:           pba,
-				authorization: authorization,
+				newPSClientHelper: ec.newPSClient,
+				node:              n,
+				id:                derivedPieceID,
+				size:              pieceSize,
+				pba:               pba,
+				authorization:     authorization,
 			}
 
 			ch <- rangerInfo{i: i, rr: rr, err: nil}
@@ -207,7 +220,7 @@ func (ec *ecClient) Get(ctx context.Context, nodes []*pb.Node, es eestream.Erasu
 		}
 	}
 
-	rr, err = eestream.Decode(rrs, es, ec.mbm)
+	rr, err = eestream.Decode(rrs, es, ec.memoryLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -215,11 +228,15 @@ func (ec *ecClient) Get(ctx context.Context, nodes []*pb.Node, es eestream.Erasu
 	return eestream.Unpad(rr, int(paddedSize-size))
 }
 
-func (ec *ecClient) Delete(ctx context.Context, nodes []*pb.Node, pieceID client.PieceID, authorization *pb.SignedMessage) (err error) {
+func (ec *ecClient) Delete(ctx context.Context, nodes []*pb.Node, pieceID psclient.PieceID, authorization *pb.SignedMessage) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	errs := make(chan error, len(nodes))
-
+	for _, v := range nodes {
+		if v != nil {
+			v.Type.DPanicOnInvalid("ec client delete")
+		}
+	}
 	for _, n := range nodes {
 		if n == nil {
 			errs <- nil
@@ -227,16 +244,16 @@ func (ec *ecClient) Delete(ctx context.Context, nodes []*pb.Node, pieceID client
 		}
 
 		go func(n *pb.Node) {
-			derivedPieceID, err := pieceID.Derive([]byte(n.GetId()))
+			derivedPieceID, err := pieceID.Derive(n.Id.Bytes())
 			if err != nil {
 				zap.S().Errorf("Failed deriving piece id for %s: %v", pieceID, err)
 				errs <- err
 				return
 			}
-			ps, err := ec.d.dial(ctx, n)
+			ps, err := ec.newPSClient(ctx, n)
 			if err != nil {
 				zap.S().Errorf("Failed dialing for deleting piece %s -> %s from node %s: %v",
-					pieceID, derivedPieceID, n.GetId(), err)
+					pieceID, derivedPieceID, n.Id, err)
 				errs <- err
 				return
 			}
@@ -246,14 +263,18 @@ func (ec *ecClient) Delete(ctx context.Context, nodes []*pb.Node, pieceID client
 			utils.LogClose(ps)
 			if err != nil {
 				zap.S().Errorf("Failed deleting piece %s -> %s from node %s: %v",
-					pieceID, derivedPieceID, n.GetId(), err)
+					pieceID, derivedPieceID, n.Id, err)
 			}
 			errs <- err
 		}(n)
 	}
 
 	allerrs := collectErrors(errs, len(nodes))
-
+	for _, v := range nodes {
+		if v != nil {
+			v.Type.DPanicOnInvalid("ec client delete 2")
+		}
+	}
 	if len(allerrs) > 0 && len(allerrs) == len(nodes) {
 		return allerrs[0]
 	}
@@ -276,16 +297,20 @@ func unique(nodes []*pb.Node) bool {
 	if len(nodes) < 2 {
 		return true
 	}
-
-	ids := make([]string, len(nodes))
+	ids := make(storj.NodeIDList, len(nodes))
 	for i, n := range nodes {
-		ids[i] = n.GetId()
+		if n != nil {
+			ids[i] = n.Id
+			n.Type.DPanicOnInvalid("ec client unique")
+		}
+
 	}
 
 	// sort the ids and check for identical neighbors
-	sort.Strings(ids)
+	sort.Sort(ids)
+	// sort.Slice(ids, func(i, k int) bool { return ids[i].Less(ids[k]) })
 	for i := 1; i < len(ids); i++ {
-		if ids[i] != "" && ids[i] == ids[i-1] {
+		if ids[i] != (storj.NodeID{}) && ids[i] == ids[i-1] {
 			return false
 		}
 	}
@@ -302,13 +327,13 @@ func calcPadded(size int64, blockSize int) int64 {
 }
 
 type lazyPieceRanger struct {
-	ranger        ranger.Ranger
-	dialer        dialer
-	node          *pb.Node
-	id            client.PieceID
-	size          int64
-	pba           *pb.PayerBandwidthAllocation
-	authorization *pb.SignedMessage
+	ranger            ranger.Ranger
+	newPSClientHelper psClientHelper
+	node              *pb.Node
+	id                psclient.PieceID
+	size              int64
+	pba               *pb.PayerBandwidthAllocation
+	authorization     *pb.SignedMessage
 }
 
 // Size implements Ranger.Size
@@ -318,8 +343,9 @@ func (lr *lazyPieceRanger) Size() int64 {
 
 // Range implements Ranger.Range to be lazily connected
 func (lr *lazyPieceRanger) Range(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+	lr.node.Type.DPanicOnInvalid("Range")
 	if lr.ranger == nil {
-		ps, err := lr.dialer.dial(ctx, lr.node)
+		ps, err := lr.newPSClientHelper(ctx, lr.node)
 		if err != nil {
 			return nil, err
 		}
@@ -332,11 +358,12 @@ func (lr *lazyPieceRanger) Range(ctx context.Context, offset, length int64) (io.
 	return lr.ranger.Range(ctx, offset, length)
 }
 
-func validCount(nodes []*pb.Node) int {
+func nonNilCount(nodes []*pb.Node) int {
 	total := 0
 	for _, node := range nodes {
 		if node != nil {
 			total++
+			node.Type.DPanicOnInvalid("nonNilCount")
 		}
 	}
 	return total

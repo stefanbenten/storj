@@ -9,29 +9,38 @@ import (
 
 	"go.uber.org/zap"
 
+	"storj.io/storj/pkg/datarepair/irreparable"
 	"storj.io/storj/pkg/datarepair/queue"
 	"storj.io/storj/pkg/overlay"
 	"storj.io/storj/pkg/pointerdb"
 	"storj.io/storj/pkg/provider"
-	"storj.io/storj/storage/redis"
+	"storj.io/storj/pkg/statdb"
 )
 
-// Config contains configurable values for repairer
+// Config contains configurable values for checker
 type Config struct {
-	QueueAddress string        `help:"data checker queue address" default:"redis://127.0.0.1:6378?db=1&password=abc123"`
-	Interval     time.Duration `help:"how frequently checker should audit segments" default:"30s"`
+	Interval time.Duration `help:"how frequently checker should audit segments" default:"30s"`
 }
 
 // Initialize a Checker struct
 func (c Config) initialize(ctx context.Context) (Checker, error) {
-	pointerdb := pointerdb.LoadFromContext(ctx)
-	overlay := overlay.LoadServerFromContext(ctx)
-	client, err := redis.NewClientFrom(c.QueueAddress)
-	if err != nil {
-		return nil, Error.Wrap(err)
+	pdb := pointerdb.LoadFromContext(ctx)
+	if pdb == nil {
+		return nil, Error.New("failed to load pointerdb from context")
 	}
-	repairQueue := queue.NewQueue(client)
-	return newChecker(pointerdb, repairQueue, overlay, 0, zap.L(), c.Interval), nil
+
+	db, ok := ctx.Value("masterdb").(interface {
+		StatDB() statdb.DB
+		Irreparable() irreparable.DB
+		RepairQueue() queue.RepairQueue
+	})
+	if !ok {
+		return nil, Error.New("unable to get master db instance")
+	}
+
+	o := overlay.LoadServerFromContext(ctx)
+
+	return newChecker(pdb, db.StatDB(), db.RepairQueue(), o, db.Irreparable(), 0, zap.L(), c.Interval), nil
 }
 
 // Run runs the checker with configured values
@@ -40,11 +49,12 @@ func (c Config) Run(ctx context.Context, server *provider.Provider) (err error) 
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithCancel(ctx)
 
-	// TODO(coyle): we need to figure out how to propagate the error up to cancel the service
 	go func() {
 		if err := check.Run(ctx); err != nil {
-			zap.L().Error("Error running checker", zap.Error(err))
+			defer cancel()
+			zap.L().Debug("Checker is shutting down", zap.Error(err))
 		}
 	}()
 

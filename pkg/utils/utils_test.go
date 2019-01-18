@@ -1,3 +1,6 @@
+// Copyright (C) 2018 Storj Labs, Inc.
+// See LICENSE for copying information.
+
 package utils_test
 
 import (
@@ -36,4 +39,22 @@ func TestCollecMultipleError(t *testing.T) {
 	err := utils.CollectErrors(errchan, 1*time.Second)
 	assert.Error(t, err)
 	assert.Equal(t, err.Error(), "error1\nerror2\nerror3")
+}
+
+func TestErrorGroup(t *testing.T) {
+	var errlist utils.ErrorGroup
+	errlist.Add(nil, nil, nil)
+	assert.NoError(t, errlist.Finish())
+	assert.Equal(t, len(errlist), 0)
+	e1 := errs.New("err1")
+	errlist.Add(nil, nil, e1, nil)
+	assert.Equal(t, errlist.Finish(), e1)
+	assert.Equal(t, len(errlist), 1)
+	e2, e3 := errs.New("err2"), errs.New("err3")
+	errlist.Add(e2, e3)
+	assert.Error(t, errlist.Finish())
+	assert.Equal(t, len(errlist), 3)
+	assert.Equal(t, errlist[0], e1)
+	assert.Equal(t, errlist[1], e2)
+	assert.Equal(t, errlist[2], e3)
 }

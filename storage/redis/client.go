@@ -4,6 +4,7 @@
 package redis
 
 import (
+	"net/url"
 	"sort"
 	"strconv"
 	"time"
@@ -11,7 +12,6 @@ import (
 	"github.com/go-redis/redis"
 	"github.com/zeebo/errs"
 
-	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage"
 )
 
@@ -20,7 +20,9 @@ var (
 	Error = errs.Class("redis error")
 )
 
-const defaultNodeExpiration = 61 * time.Minute
+// TODO(coyle): this should be set to 61 * time.Minute after we implement Ping and Refresh on Overlay Cache
+// This disables the TTL since the Set command only includes a TTL if it is greater than 0
+const defaultNodeExpiration = 0 * time.Minute
 
 // Client is the entrypoint into Redis
 type Client struct {
@@ -49,7 +51,7 @@ func NewClient(address, password string, db int) (*Client, error) {
 
 // NewClientFrom returns a configured Client instance from a redis address, verifying a successful connection to redis
 func NewClientFrom(address string) (*Client, error) {
-	redisurl, err := utils.ParseURL(address)
+	redisurl, err := url.Parse(address)
 	if err != nil {
 		return nil, err
 	}
@@ -70,6 +72,10 @@ func NewClientFrom(address string) (*Client, error) {
 
 // Get looks up the provided key from redis returning either an error or the result.
 func (client *Client) Get(key storage.Key) (storage.Value, error) {
+	if key.IsZero() {
+		return nil, storage.ErrEmptyKey.New("")
+	}
+
 	value, err := client.db.Get(string(key)).Bytes()
 	if err == redis.Nil {
 		return nil, storage.ErrKeyNotFound.New(key.String())
@@ -82,9 +88,10 @@ func (client *Client) Get(key storage.Key) (storage.Value, error) {
 
 // Put adds a value to the provided key in redis, returning an error on failure.
 func (client *Client) Put(key storage.Key, value storage.Value) error {
-	if len(key) == 0 {
-		return Error.New("invalid key")
+	if key.IsZero() {
+		return storage.ErrEmptyKey.New("")
 	}
+
 	err := client.db.Set(key.String(), []byte(value), client.TTL).Err()
 	if err != nil {
 		return Error.New("put error: %v", err)
@@ -105,6 +112,10 @@ func (client *Client) ReverseList(first storage.Key, limit int) (storage.Keys, e
 
 // Delete deletes a key/value pair from redis, for a given the key
 func (client *Client) Delete(key storage.Key) error {
+	if key.IsZero() {
+		return storage.ErrEmptyKey.New("")
+	}
+
 	err := client.db.Del(key.String()).Err()
 	if err != nil {
 		return Error.New("delete error: %v", err)
@@ -171,6 +182,12 @@ func (client *Client) Iterate(opts storage.IterateOptions, fn func(it storage.It
 	return fn(&storage.StaticIterator{
 		Items: all,
 	})
+}
+
+// FlushDB deletes all keys in the currently selected DB.
+func (client *Client) FlushDB() error {
+	_, err := client.db.FlushDB().Result()
+	return err
 }
 
 func (client *Client) allPrefixedItems(prefix, first, last storage.Key) (storage.Items, error) {

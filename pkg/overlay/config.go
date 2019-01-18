@@ -5,17 +5,17 @@ package overlay
 
 import (
 	"context"
-	"net/url"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zeebo/errs"
 	"go.uber.org/zap"
 	monkit "gopkg.in/spacemonkeygo/monkit.v2"
 
-	"storj.io/storj/pkg/kademlia"
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/provider"
+	"storj.io/storj/pkg/statdb"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/utils"
 )
 
@@ -28,11 +28,26 @@ var (
 // Config is a configuration struct for everything you need to start the
 // Overlay cache responsibility.
 type Config struct {
-	DatabaseURL     string        `help:"the database connection string to use" default:"bolt://$CONFDIR/overlay.db"`
-	RefreshInterval time.Duration `help:"the interval at which the cache refreshes itself in seconds" default:"30s"`
+	RefreshInterval time.Duration `help:"the interval at which the cache refreshes itself in seconds" default:"1s"`
+	Node            NodeSelectionConfig
 }
 
-// CtxKey used for assigning cache
+// LookupConfig is a configuration struct for querying the overlay cache with one or more node IDs
+type LookupConfig struct {
+	NodeIDsString string `help:"one or more string-encoded node IDs, delimited by Delimiter"`
+	Delimiter     string `help:"delimiter used for parsing node IDs" default:","`
+}
+
+// NodeSelectionConfig is a configuration struct to determine the minimum
+// values for nodes to select
+type NodeSelectionConfig struct {
+	UptimeRatio       float64 `help:"a node's ratio of being up/online vs. down/offline" default:"0"`
+	UptimeCount       int64   `help:"the number of times a node's uptime has been checked" default:"0"`
+	AuditSuccessRatio float64 `help:"a node's ratio of successful audits" default:"0"`
+	AuditCount        int64   `help:"the number of times a node has been audited" default:"0"`
+}
+
+// CtxKey used for assigning cache and server
 type CtxKey int
 
 const (
@@ -46,75 +61,34 @@ func (c Config) Run(ctx context.Context, server *provider.Provider) (
 	err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	kad := kademlia.LoadFromContext(ctx)
-	if kad == nil {
-		return Error.New("programmer error: kademlia responsibility unstarted")
+	sdb, ok := ctx.Value("masterdb").(interface {
+		StatDB() statdb.DB
+		OverlayCache() DB
+	})
+	if !ok {
+		return Error.Wrap(errs.New("unable to get master db instance"))
 	}
 
-	dburl, err := utils.ParseURL(c.DatabaseURL)
-	if err != nil {
-		return Error.Wrap(err)
+	cache := NewCache(sdb.OverlayCache(), sdb.StatDB())
+
+	ns := &pb.NodeStats{
+		UptimeCount:       c.Node.UptimeCount,
+		UptimeRatio:       c.Node.UptimeRatio,
+		AuditSuccessRatio: c.Node.AuditSuccessRatio,
+		AuditCount:        c.Node.AuditCount,
 	}
 
-	var cache *Cache
-	switch dburl.Scheme {
-	case "bolt":
-		cache, err = NewBoltOverlayCache(dburl.Path, kad)
-		if err != nil {
-			return err
-		}
-		zap.S().Info("Starting overlay cache with BoltDB")
-	case "redis":
-		db, err := strconv.Atoi(dburl.Query().Get("db"))
-		if err != nil {
-			return Error.New("invalid db: %s", err)
-		}
-		cache, err = NewRedisOverlayCache(dburl.Host, GetUserPassword(dburl), db, kad)
-		if err != nil {
-			return err
-		}
-		zap.S().Info("Starting overlay cache with Redis")
-	default:
-		return Error.New("database scheme not supported: %s", dburl.Scheme)
-	}
-
-	err = cache.Bootstrap(ctx)
-	if err != nil {
-		return err
-	}
-
-	ticker := time.NewTicker(c.RefreshInterval)
-	defer ticker.Stop()
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				err := cache.Refresh(ctx)
-				if err != nil {
-					zap.S().Error("Error with cache refresh: ", err)
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	srv := &Server{
-		dht:   kad,
-		cache: cache,
-
-		// TODO(jt): do something else
-		logger:  zap.L(),
-		metrics: monkit.Default,
-	}
+	srv := NewServer(zap.L(), cache, ns)
 	pb.RegisterOverlayServer(server.GRPC(), srv)
-	ctx = context.WithValue(ctx, ctxKeyOverlay, cache)
-	ctx = context.WithValue(ctx, ctxKeyOverlayServer, srv)
-	return server.Run(ctx)
+
+	zap.S().Warn("Once the Peer refactor is done, the overlay inspector needs to be registered on a " +
+		"gRPC server that only listens on localhost")
+	// TODO: register on a private rpc server
+	pb.RegisterOverlayInspectorServer(server.GRPC(), NewInspector(cache))
+
+	ctx2 := context.WithValue(ctx, ctxKeyOverlay, cache)
+	ctx2 = context.WithValue(ctx2, ctxKeyOverlayServer, srv)
+	return server.Run(ctx2)
 }
 
 // LoadFromContext gives access to the cache from the context, or returns nil
@@ -133,13 +107,20 @@ func LoadServerFromContext(ctx context.Context) *Server {
 	return nil
 }
 
-// GetUserPassword extracts password from scheme://user:password@hostname
-func GetUserPassword(u *url.URL) string {
-	if u == nil || u.User == nil {
-		return ""
+// ParseIDs converts the base58check encoded node ID strings from the config into node IDs
+func (c LookupConfig) ParseIDs() (ids storj.NodeIDList, err error) {
+	var idErrs []error
+	idStrs := strings.Split(c.NodeIDsString, c.Delimiter)
+	for _, s := range idStrs {
+		id, err := storj.NodeIDFromString(s)
+		if err != nil {
+			idErrs = append(idErrs, err)
+			continue
+		}
+		ids = append(ids, id)
 	}
-	if pw, ok := u.User.Password(); ok {
-		return pw
+	if err := utils.CombineErrors(idErrs...); err != nil {
+		return nil, err
 	}
-	return ""
+	return ids, nil
 }

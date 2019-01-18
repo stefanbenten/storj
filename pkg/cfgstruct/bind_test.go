@@ -4,11 +4,13 @@
 package cfgstruct
 
 import (
-	"flag"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 func assertEqual(actual, expected interface{}) {
@@ -18,7 +20,7 @@ func assertEqual(actual, expected interface{}) {
 }
 
 func TestBind(t *testing.T) {
-	f := flag.NewFlagSet("test", flag.PanicOnError)
+	f := pflag.NewFlagSet("test", pflag.PanicOnError)
 	var c struct {
 		String   string        `default:""`
 		Bool     bool          `default:"false"`
@@ -73,4 +75,38 @@ func TestBind(t *testing.T) {
 	assertEqual(c.Struct.AnotherString, string("1"))
 	assertEqual(c.Fields[0].AnotherInt, int(0))
 	assertEqual(c.Fields[3].AnotherInt, int(1))
+}
+
+func TestConfDir(t *testing.T) {
+	f := pflag.NewFlagSet("test", pflag.PanicOnError)
+	var c struct {
+		String    string `default:"-$CONFDIR+"`
+		MyStruct1 struct {
+			String    string `default:"1${CONFDIR}2"`
+			MyStruct2 struct {
+				String string `default:"2${CONFDIR}3"`
+			}
+		}
+	}
+	Bind(f, &c, ConfDir("confpath"))
+	assertEqual(f.Lookup("string").DefValue, "-confpath+")
+	assertEqual(f.Lookup("my-struct1.string").DefValue, "1confpath2")
+	assertEqual(f.Lookup("my-struct1.my-struct2.string").DefValue, "2confpath3")
+}
+
+func TestNesting(t *testing.T) {
+	f := pflag.NewFlagSet("test", pflag.PanicOnError)
+	var c struct {
+		String    string `default:"-$CONFDIR+"`
+		MyStruct1 struct {
+			String    string `default:"1${CONFDIR}2"`
+			MyStruct2 struct {
+				String string `default:"2${CONFDIR}3"`
+			}
+		}
+	}
+	Bind(f, &c, ConfDirNested("confpath"))
+	assertEqual(f.Lookup("string").DefValue, "-confpath+")
+	assertEqual(f.Lookup("my-struct1.string").DefValue, filepath.FromSlash("1confpath/my-struct12"))
+	assertEqual(f.Lookup("my-struct1.my-struct2.string").DefValue, filepath.FromSlash("2confpath/my-struct1/my-struct23"))
 }

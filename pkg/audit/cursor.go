@@ -13,26 +13,28 @@ import (
 
 	"storj.io/storj/pkg/eestream"
 	"storj.io/storj/pkg/pb"
-	"storj.io/storj/pkg/pointerdb/pdbclient"
+	"storj.io/storj/pkg/pointerdb"
 	"storj.io/storj/pkg/storage/meta"
 	"storj.io/storj/pkg/storj"
 )
 
 // Stripe keeps track of a stripe's index and its parent segment
 type Stripe struct {
-	Index   int
-	Segment *pb.Pointer
+	Index         int
+	Segment       *pb.Pointer
+	PBA           *pb.PayerBandwidthAllocation
+	Authorization *pb.SignedMessage
 }
 
 // Cursor keeps track of audit location in pointer db
 type Cursor struct {
-	pointers pdbclient.Client
+	pointers *pointerdb.Server
 	lastPath storj.Path
 	mutex    sync.Mutex
 }
 
 // NewCursor creates a Cursor which iterates over pointer db
-func NewCursor(pointers pdbclient.Client) *Cursor {
+func NewCursor(pointers *pointerdb.Server) *Cursor {
 	return &Cursor{pointers: pointers}
 }
 
@@ -41,27 +43,34 @@ func (cursor *Cursor) NextStripe(ctx context.Context) (stripe *Stripe, err error
 	cursor.mutex.Lock()
 	defer cursor.mutex.Unlock()
 
-	var pointerItems []pdbclient.ListItem
+	var pointerItems []*pb.ListResponse_Item
 	var path storj.Path
 	var more bool
 
-	if cursor.lastPath == "" {
-		pointerItems, more, err = cursor.pointers.List(ctx, "", "", "", true, 0, meta.None)
-	} else {
-		pointerItems, more, err = cursor.pointers.List(ctx, "", cursor.lastPath, "", true, 0, meta.None)
-	}
-
+	listRes, err := cursor.pointers.List(ctx, &pb.ListRequest{
+		Prefix:     "",
+		StartAfter: cursor.lastPath,
+		EndBefore:  "",
+		Recursive:  true,
+		Limit:      0,
+		MetaFlags:  meta.None,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// get random pointer
+	pointerItems = listRes.GetItems()
+	more = listRes.GetMore()
+
+	if len(pointerItems) == 0 {
+		return nil, nil
+	}
+
 	pointerItem, err := getRandomPointer(pointerItems)
 	if err != nil {
 		return nil, err
 	}
 
-	// get path
 	path = pointerItem.Path
 
 	// keep track of last path listed
@@ -72,9 +81,16 @@ func (cursor *Cursor) NextStripe(ctx context.Context) (stripe *Stripe, err error
 	}
 
 	// get pointer info
-	pointer, err := cursor.pointers.Get(ctx, path)
+	getRes, err := cursor.pointers.Get(ctx, &pb.GetRequest{Path: path})
 	if err != nil {
 		return nil, err
+	}
+	pointer := getRes.GetPointer()
+	pba := getRes.GetPba()
+	authorization := getRes.GetAuthorization()
+
+	if pointer.GetType() != pb.Pointer_REMOTE {
+		return nil, nil
 	}
 
 	// create the erasure scheme so we can get the stripe size
@@ -83,18 +99,28 @@ func (cursor *Cursor) NextStripe(ctx context.Context) (stripe *Stripe, err error
 		return nil, err
 	}
 
-	//get random stripe
+	if pointer.GetSegmentSize() == 0 {
+		return nil, nil
+	}
+
 	index, err := getRandomStripe(es, pointer)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Stripe{Index: index, Segment: pointer}, nil
+	return &Stripe{
+		Index:         index,
+		Segment:       pointer,
+		PBA:           pba,
+		Authorization: authorization,
+	}, nil
 }
 
-// create the erasure scheme
 func makeErasureScheme(rs *pb.RedundancyScheme) (eestream.ErasureScheme, error) {
-	fc, err := infectious.NewFEC(int(rs.GetMinReq()), int(rs.GetTotal()))
+	required := int(rs.GetMinReq())
+	total := int(rs.GetTotal())
+
+	fc, err := infectious.NewFEC(required, total)
 	if err != nil {
 		return nil, err
 	}
@@ -104,17 +130,23 @@ func makeErasureScheme(rs *pb.RedundancyScheme) (eestream.ErasureScheme, error) 
 
 func getRandomStripe(es eestream.ErasureScheme, pointer *pb.Pointer) (index int, err error) {
 	stripeSize := es.StripeSize()
-	randomStripeIndex, err := rand.Int(rand.Reader, big.NewInt(pointer.GetSize()/int64(stripeSize)))
+
+	// the last segment could be smaller than stripe size
+	if pointer.GetSegmentSize() < int64(stripeSize) {
+		return 0, nil
+	}
+
+	randomStripeIndex, err := rand.Int(rand.Reader, big.NewInt(pointer.GetSegmentSize()/int64(stripeSize)))
 	if err != nil {
 		return -1, err
 	}
 	return int(randomStripeIndex.Int64()), nil
 }
 
-func getRandomPointer(pointerItems []pdbclient.ListItem) (pointer pdbclient.ListItem, err error) {
+func getRandomPointer(pointerItems []*pb.ListResponse_Item) (pointer *pb.ListResponse_Item, err error) {
 	randomNum, err := rand.Int(rand.Reader, big.NewInt(int64(len(pointerItems))))
 	if err != nil {
-		return pdbclient.ListItem{}, err
+		return &pb.ListResponse_Item{}, err
 	}
 	randomNumInt64 := randomNum.Int64()
 	pointerItem := pointerItems[randomNumInt64]

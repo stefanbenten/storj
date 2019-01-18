@@ -7,39 +7,43 @@ import (
 	"context"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/gogo/protobuf/proto"
 	"go.uber.org/zap"
 
+	"storj.io/storj/pkg/datarepair/irreparable"
 	"storj.io/storj/pkg/datarepair/queue"
-	"storj.io/storj/pkg/dht"
-	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/pointerdb"
+	"storj.io/storj/pkg/statdb"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/storage"
 )
 
-// Checker is the interface for the data repair queue
+// Checker is the interface for data repair checker
 type Checker interface {
-	IdentifyInjuredSegments(ctx context.Context) (err error)
 	Run(ctx context.Context) error
 }
 
 // Checker contains the information needed to do checks for missing pieces
 type checker struct {
+	statdb      statdb.DB
 	pointerdb   *pointerdb.Server
-	repairQueue *queue.Queue
+	repairQueue queue.RepairQueue
 	overlay     pb.OverlayServer
+	irrdb       irreparable.DB
 	limit       int
 	logger      *zap.Logger
 	ticker      *time.Ticker
 }
 
-// NewChecker creates a new instance of checker
-func newChecker(pointerdb *pointerdb.Server, repairQueue *queue.Queue, overlay pb.OverlayServer, limit int, logger *zap.Logger, interval time.Duration) *checker {
+// newChecker creates a new instance of checker
+func newChecker(pointerdb *pointerdb.Server, sdb statdb.DB, repairQueue queue.RepairQueue, overlay pb.OverlayServer, irrdb irreparable.DB, limit int, logger *zap.Logger, interval time.Duration) *checker {
 	return &checker{
+		statdb:      sdb,
 		pointerdb:   pointerdb,
 		repairQueue: repairQueue,
 		overlay:     overlay,
+		irrdb:       irrdb,
 		limit:       limit,
 		logger:      logger,
 		ticker:      time.NewTicker(interval),
@@ -51,9 +55,9 @@ func (c *checker) Run(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
 	for {
-		err = c.IdentifyInjuredSegments(ctx)
+		err = c.identifyInjuredSegments(ctx)
 		if err != nil {
-			zap.L().Error("Checker failed", zap.Error(err))
+			c.logger.Error("Checker failed", zap.Error(err))
 		}
 
 		select {
@@ -64,10 +68,9 @@ func (c *checker) Run(ctx context.Context) (err error) {
 	}
 }
 
-// IdentifyInjuredSegments checks for missing pieces off of the pointerdb and overlay cache
-func (c *checker) IdentifyInjuredSegments(ctx context.Context) (err error) {
+// identifyInjuredSegments checks for missing pieces off of the pointerdb and overlay cache
+func (c *checker) identifyInjuredSegments(ctx context.Context) (err error) {
 	defer mon.Task()(&ctx)(&err)
-	c.logger.Debug("entering pointerdb iterate")
 
 	err = c.pointerdb.Iterate(ctx, &pb.IterateRequest{Recurse: true},
 		func(it storage.Iterator) error {
@@ -78,27 +81,64 @@ func (c *checker) IdentifyInjuredSegments(ctx context.Context) (err error) {
 			}
 			for ; lim > 0 && it.Next(&item); lim-- {
 				pointer := &pb.Pointer{}
+
 				err = proto.Unmarshal(item.Value, pointer)
 				if err != nil {
 					return Error.New("error unmarshalling pointer %s", err)
 				}
-				pieces := pointer.Remote.RemotePieces
-				var nodeIDs []dht.NodeID
+
+				remote := pointer.GetRemote()
+				if remote == nil {
+					continue
+				}
+
+				pieces := remote.GetRemotePieces()
+				if pieces == nil {
+					c.logger.Debug("no pieces on remote segment")
+					continue
+				}
+
+				var nodeIDs storj.NodeIDList
 				for _, p := range pieces {
-					nodeIDs = append(nodeIDs, node.IDFromString(p.NodeId))
+					nodeIDs = append(nodeIDs, p.NodeId)
 				}
-				missingPieces, err := c.offlineNodes(ctx, nodeIDs)
+
+				// Find all offline nodes
+				offlineNodes, err := c.offlineNodes(ctx, nodeIDs)
 				if err != nil {
-					return Error.New("error getting missing offline nodes %s", err)
+					return Error.New("error getting offline nodes %s", err)
 				}
+
+				invalidNodes, err := c.invalidNodes(ctx, nodeIDs)
+				if err != nil {
+					return Error.New("error getting invalid nodes %s", err)
+				}
+
+				missingPieces := combineOfflineWithInvalid(offlineNodes, invalidNodes)
+
 				numHealthy := len(nodeIDs) - len(missingPieces)
-				if int32(numHealthy) < pointer.Remote.Redundancy.RepairThreshold {
-					err = c.repairQueue.Enqueue(&pb.InjuredSegment{
+				if (int32(numHealthy) >= pointer.Remote.Redundancy.MinReq) && (int32(numHealthy) < pointer.Remote.Redundancy.RepairThreshold) {
+					err = c.repairQueue.Enqueue(ctx, &pb.InjuredSegment{
 						Path:       string(item.Key),
 						LostPieces: missingPieces,
 					})
 					if err != nil {
 						return Error.New("error adding injured segment to queue %s", err)
+					}
+				} else if int32(numHealthy) < pointer.Remote.Redundancy.MinReq {
+					// make an entry in to the irreparable table
+					segmentInfo := &irreparable.RemoteSegmentInfo{
+						EncryptedSegmentPath:   item.Key,
+						EncryptedSegmentDetail: item.Value,
+						LostPiecesCount:        int64(len(missingPieces)),
+						RepairUnixSec:          time.Now().Unix(),
+						RepairAttemptCount:     int64(1),
+					}
+
+					//add the entry if new or update attempt count if already exists
+					err := c.irrdb.IncrementRepairAttempts(ctx, segmentInfo)
+					if err != nil {
+						return Error.New("error handling irreparable segment to queue %s", err)
 					}
 				}
 			}
@@ -108,13 +148,13 @@ func (c *checker) IdentifyInjuredSegments(ctx context.Context) (err error) {
 	return err
 }
 
-// returns the indices of offline and online nodes
-func (c *checker) offlineNodes(ctx context.Context, nodeIDs []dht.NodeID) (offline []int32, err error) {
-	responses, err := c.overlay.BulkLookup(ctx, nodeIDsToLookupRequests(nodeIDs))
+// returns the indices of offline nodes
+func (c *checker) offlineNodes(ctx context.Context, nodeIDs storj.NodeIDList) (offline []int32, err error) {
+	responses, err := c.overlay.BulkLookup(ctx, pb.NodeIDsToLookupRequests(nodeIDs))
 	if err != nil {
 		return []int32{}, err
 	}
-	nodes := lookupResponsesToNodes(responses)
+	nodes := pb.LookupResponsesToNodes(responses)
 	for i, n := range nodes {
 		if n == nil {
 			offline = append(offline, int32(i))
@@ -123,20 +163,46 @@ func (c *checker) offlineNodes(ctx context.Context, nodeIDs []dht.NodeID) (offli
 	return offline, nil
 }
 
-func nodeIDsToLookupRequests(nodeIDs []dht.NodeID) *pb.LookupRequests {
-	var rq []*pb.LookupRequest
-	for _, v := range nodeIDs {
-		r := &pb.LookupRequest{NodeID: v.String()}
-		rq = append(rq, r)
+// Find invalidNodes by checking the audit results that are place in statdb
+func (c *checker) invalidNodes(ctx context.Context, nodeIDs storj.NodeIDList) (invalidNodes []int32, err error) {
+	// filter if nodeIDs have invalid pieces from auditing results
+	maxStats := &statdb.NodeStats{
+		AuditSuccessRatio: 0, // TODO: update when we have stats added to statdb
+		UptimeRatio:       0, // TODO: update when we have stats added to statdb
 	}
-	return &pb.LookupRequests{Lookuprequest: rq}
+
+	invalidIDs, err := c.statdb.FindInvalidNodes(ctx, nodeIDs, maxStats)
+	if err != nil {
+		return nil, Error.New("error getting valid nodes from statdb %s", err)
+	}
+
+	invalidNodesMap := make(map[storj.NodeID]bool)
+	for _, invalidID := range invalidIDs {
+		invalidNodesMap[invalidID] = true
+	}
+
+	for i, nID := range nodeIDs {
+		if invalidNodesMap[nID] {
+			invalidNodes = append(invalidNodes, int32(i))
+		}
+	}
+
+	return invalidNodes, nil
 }
 
-func lookupResponsesToNodes(responses *pb.LookupResponses) []*pb.Node {
-	var nodes []*pb.Node
-	for _, v := range responses.Lookupresponse {
-		n := v.Node
-		nodes = append(nodes, n)
+// combine the offline nodes with nodes marked invalid by statdb
+func combineOfflineWithInvalid(offlineNodes []int32, invalidNodes []int32) (missingPieces []int32) {
+	missingPieces = append(missingPieces, offlineNodes...)
+
+	offlineMap := make(map[int32]bool)
+	for _, i := range offlineNodes {
+		offlineMap[i] = true
 	}
-	return nodes
+	for _, i := range invalidNodes {
+		if !offlineMap[i] {
+			missingPieces = append(missingPieces, i)
+		}
+	}
+
+	return missingPieces
 }

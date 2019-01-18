@@ -5,58 +5,64 @@
 package kademlia
 
 import (
+	"bytes"
 	"context"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 
-	"storj.io/storj/pkg/dht"
+	"storj.io/storj/internal/testcontext"
+	"storj.io/storj/internal/testidentity"
+	"storj.io/storj/internal/teststorj"
+	"storj.io/storj/pkg/identity"
 	"storj.io/storj/pkg/node"
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/provider"
+	"storj.io/storj/pkg/storj"
 )
 
-// helper function to generate new node identities with
-// correct difficulty and concurrency
-func newTestIdentity() (*provider.FullIdentity, error) {
-	fid, err := node.NewFullIdentity(context.Background(), 12, 4)
-	return fid, err
-}
+const (
+	defaultAlpha = 5
+)
 
 func TestNewKademlia(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	rootdir, cleanup := mktempdir(t, "kademlia")
 	defer cleanup()
 	cases := []struct {
-		id          dht.NodeID
+		id          *identity.FullIdentity
 		bn          []pb.Node
 		addr        string
 		expectedErr error
 	}{
 		{
-			id: func() *node.ID {
-				id, err := newTestIdentity()
+			id: func() *identity.FullIdentity {
+				id, err := testidentity.NewTestIdentity(ctx)
 				assert.NoError(t, err)
-				n := node.ID(id.ID)
-				return &n
+				return id
 			}(),
-			bn:   []pb.Node{pb.Node{Id: "foo"}},
+			bn:   []pb.Node{{Id: teststorj.NodeIDFromString("foo")}},
 			addr: "127.0.0.1:8080",
 		},
 		{
-			id: func() *node.ID {
-				id, err := newTestIdentity()
+			id: func() *provider.FullIdentity {
+				id, err := testidentity.NewTestIdentity(ctx)
 				assert.NoError(t, err)
-				n := node.ID(id.ID)
-				return &n
+				return id
 			}(),
-			bn:   []pb.Node{pb.Node{Id: "foo"}},
+			bn:   []pb.Node{{Id: teststorj.NodeIDFromString("foo")}},
 			addr: "127.0.0.1:8080",
 		},
 	}
@@ -64,12 +70,7 @@ func TestNewKademlia(t *testing.T) {
 	for i, v := range cases {
 		dir := filepath.Join(rootdir, strconv.Itoa(i))
 
-		ca, err := provider.NewTestCA(context.Background())
-		assert.NoError(t, err)
-		identity, err := ca.NewIdentity()
-		assert.NoError(t, err)
-
-		kad, err := NewKademlia(v.id, v.bn, v.addr, identity, dir, defaultAlpha)
+		kad, err := NewKademlia(zaptest.NewLogger(t), pb.NodeType_STORAGE, v.bn, v.addr, nil, v.id, dir, defaultAlpha)
 		assert.NoError(t, err)
 		assert.Equal(t, v.expectedErr, err)
 		assert.Equal(t, kad.bootstrapNodes, v.bn)
@@ -81,76 +82,62 @@ func TestNewKademlia(t *testing.T) {
 }
 
 func TestPeerDiscovery(t *testing.T) {
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	addr := lis.Addr().String()
-
-	assert.NoError(t, err)
-
-	srv, mns := newTestServer([]*pb.Node{&pb.Node{Id: "foo"}})
-	go func() { assert.NoError(t, srv.Serve(lis)) }()
-	defer srv.Stop()
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
 
 	dir, cleanup := mktempdir(t, "kademlia")
 	defer cleanup()
-	k := func() *Kademlia {
-		// make new identity
-		fid, err := newTestIdentity()
-		assert.NoError(t, err)
-		fid2, err := newTestIdentity()
-		assert.NoError(t, err)
+	// make new identity
+	bootServer, mockBootServer, bootID, bootAddress := startTestNodeServer(ctx)
+	defer bootServer.Stop()
+	testServer, _, testID, testAddress := startTestNodeServer(ctx)
+	defer testServer.Stop()
+	targetServer, _, targetID, targetAddress := startTestNodeServer(ctx)
+	defer targetServer.Stop()
 
-		// create two new unique identities
-		id := fid.ID
-		id2 := fid2.ID
-		assert.NotEqual(t, id, id2)
-
-		kid := dht.NodeID(fid.ID)
-		k, err := NewKademlia(kid, []pb.Node{pb.Node{Id: id2.String(), Address: &pb.NodeAddress{Address: lis.Addr().String()}}}, lis.Addr().String(), fid, dir, defaultAlpha)
-		assert.NoError(t, err)
-		return k
-	}()
+	bootstrapNodes := []pb.Node{{Id: bootID.ID, Address: &pb.NodeAddress{Address: bootAddress}, Type: pb.NodeType_STORAGE}}
+	metadata := &pb.NodeMetadata{
+		Email:  "foo@bar.com",
+		Wallet: "OperatorWallet",
+	}
+	k, err := NewKademlia(zaptest.NewLogger(t), pb.NodeType_STORAGE, bootstrapNodes, testAddress, metadata, testID, dir, defaultAlpha)
+	assert.NoError(t, err)
+	rt, err := k.GetRoutingTable(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, rt.Local().Metadata.Email, "foo@bar.com")
+	assert.Equal(t, rt.Local().Metadata.Wallet, "OperatorWallet")
 
 	defer func() {
 		assert.NoError(t, k.Disconnect())
 	}()
 
 	cases := []struct {
-		target      dht.NodeID
-		opts        discoveryOptions
+		target      storj.NodeID
 		expected    *pb.Node
 		expectedErr error
 	}{
-		{target: func() *node.ID {
-			fid, err := newTestIdentity()
-			id := dht.NodeID(fid.ID)
-			nid := node.ID(fid.ID)
-			assert.NoError(t, err)
-			mns.returnValue = []*pb.Node{&pb.Node{Id: id.String(), Address: &pb.NodeAddress{Address: addr}}}
-			return &nid
+		{target: func() storj.NodeID {
+			mockBootServer.returnValue = []*pb.Node{{Id: targetID.ID, Type: pb.NodeType_STORAGE, Address: &pb.NodeAddress{Address: targetAddress}}}
+			return targetID.ID
 		}(),
-			opts:        discoveryOptions{concurrency: 3, bootstrap: true, retries: 1},
 			expected:    &pb.Node{},
 			expectedErr: nil,
 		},
-		{target: func() *node.ID {
-			id, err := newTestIdentity()
-			assert.NoError(t, err)
-			n := node.ID(id.ID)
-			return &n
-		}(),
-			opts:        discoveryOptions{concurrency: 3, bootstrap: true, retries: 1},
+		{target: bootID.ID,
 			expected:    nil,
 			expectedErr: nil,
 		},
 	}
-
 	for _, v := range cases {
-		err := k.lookup(context.Background(), v.target, v.opts)
+		_, err := k.lookup(ctx, v.target, true)
 		assert.Equal(t, v.expectedErr, err)
 	}
 }
 
 func TestBootstrap(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
 	bn, s, clean := testNode(t, []pb.Node{})
 	defer clean()
 	defer s.Stop()
@@ -159,14 +146,14 @@ func TestBootstrap(t *testing.T) {
 	defer clean1()
 	defer s1.Stop()
 
-	err := n1.Bootstrap(context.Background())
+	err := n1.Bootstrap(ctx)
 	assert.NoError(t, err)
 
 	n2, s2, clean2 := testNode(t, []pb.Node{bn.routingTable.self})
 	defer clean2()
 	defer s2.Stop()
 
-	err = n2.Bootstrap(context.Background())
+	err = n2.Bootstrap(ctx)
 	assert.NoError(t, err)
 
 	nodeIDs, err := n2.routingTable.nodeBucketDB.List(nil, 0)
@@ -175,20 +162,21 @@ func TestBootstrap(t *testing.T) {
 }
 
 func testNode(t *testing.T, bn []pb.Node) (*Kademlia, *grpc.Server, func()) {
+	ctx := testcontext.New(t)
 	// new address
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	assert.NoError(t, err)
 	// new config
 	// new identity
-	fid, err := newTestIdentity()
-	id := dht.NodeID(fid.ID)
+	fid, err := testidentity.NewTestIdentity(ctx)
 	assert.NoError(t, err)
 	// new kademlia
 	dir, cleanup := mktempdir(t, "kademlia")
 
-	k, err := NewKademlia(id, bn, lis.Addr().String(), fid, dir, defaultAlpha)
+	logger := zaptest.NewLogger(t)
+	k, err := NewKademlia(logger, pb.NodeType_STORAGE, bn, lis.Addr().String(), nil, fid, dir, defaultAlpha)
 	assert.NoError(t, err)
-	s := node.NewServer(k)
+	s := node.NewServer(logger, k)
 	// new ident opts
 	identOpt, err := fid.ServerOption()
 	assert.NoError(t, err)
@@ -202,41 +190,72 @@ func testNode(t *testing.T, bn []pb.Node) (*Kademlia, *grpc.Server, func()) {
 		defer cleanup()
 		assert.NoError(t, k.Disconnect())
 	}
+}
 
+func TestRefresh(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+	k, s, clean := testNode(t, []pb.Node{})
+	defer clean()
+	defer s.Stop()
+	//turn back time for only bucket
+	rt := k.routingTable
+	now := time.Now().UTC()
+	bID := firstBucketID //always exists
+	err := rt.SetBucketTimestamp(bID[:], now.Add(-2*time.Hour))
+	assert.NoError(t, err)
+	//refresh should  call FindNode, updating the time
+	err = k.refresh(ctx)
+	assert.NoError(t, err)
+	ts1, err := rt.GetBucketTimestamp(bID[:])
+	assert.NoError(t, err)
+	assert.True(t, now.Add(-5*time.Minute).Before(ts1))
+	//refresh should not call FindNode, leaving the previous time
+	err = k.refresh(ctx)
+	assert.NoError(t, err)
+	ts2, err := rt.GetBucketTimestamp(bID[:])
+	assert.NoError(t, err)
+	assert.True(t, ts1.Equal(ts2))
 }
 
 func TestGetNodes(t *testing.T) {
+	ctx := testcontext.New(t)
+	defer ctx.Cleanup()
+
+	var (
+		nodeIDA = teststorj.NodeIDFromString("AAAAA")
+		nodeIDB = teststorj.NodeIDFromString("BBBBB")
+		nodeIDC = teststorj.NodeIDFromString("CCCCC")
+		nodeIDD = teststorj.NodeIDFromString("DDDDD")
+	)
+
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 
 	assert.NoError(t, err)
 
-	srv, _ := newTestServer([]*pb.Node{&pb.Node{Id: "foo"}})
+	srv, _ := newTestServer(ctx, []*pb.Node{{Id: teststorj.NodeIDFromString("foo")}})
 	go func() { assert.NoError(t, srv.Serve(lis)) }()
 	defer srv.Stop()
 
 	// make new identity
-	fid, err := newTestIdentity()
+	fid, err := testidentity.NewTestIdentity(ctx)
 	assert.NoError(t, err)
-	fid2, err := newTestIdentity()
+	fid2, err := testidentity.NewTestIdentity(ctx)
 	assert.NoError(t, err)
-	fid.ID = "AAAAA"
-	fid2.ID = "BBBBB"
+	fid.ID = nodeIDA
+	fid2.ID = nodeIDB
 	// create two new unique identities
-	id := node.ID(fid.ID)
-	id2 := node.ID(fid2.ID)
-	assert.NotEqual(t, id, id2)
-	kid := dht.NodeID(fid.ID)
-
+	assert.NotEqual(t, fid.ID, fid2.ID)
 	dir, cleanup := mktempdir(t, "kademlia")
 	defer cleanup()
-	k, err := NewKademlia(kid, []pb.Node{pb.Node{Id: id2.String(), Address: &pb.NodeAddress{Address: lis.Addr().String()}}}, lis.Addr().String(), fid, dir, defaultAlpha)
+	k, err := NewKademlia(zaptest.NewLogger(t), pb.NodeType_STORAGE, []pb.Node{{Id: fid2.ID, Address: &pb.NodeAddress{Address: lis.Addr().String()}}}, lis.Addr().String(), nil, fid, dir, defaultAlpha)
 	assert.NoError(t, err)
 	defer func() {
 		assert.NoError(t, k.Disconnect())
 	}()
 
 	// add nodes
-	ids := []string{"AAAAA", "BBBBB", "CCCCC", "DDDDD"}
+	ids := storj.NodeIDList{nodeIDA, nodeIDB, nodeIDC, nodeIDD}
 	bw := []int64{1, 2, 3, 4}
 	disk := []int64{4, 3, 2, 1}
 	nodes := []*pb.Node{}
@@ -247,6 +266,7 @@ func TestGetNodes(t *testing.T) {
 				FreeBandwidth: bw[i],
 				FreeDisk:      disk[i],
 			},
+			Type: pb.NodeType_STORAGE,
 		}
 		nodes = append(nodes, n)
 		err = k.routingTable.ConnectionSuccess(n)
@@ -255,42 +275,42 @@ func TestGetNodes(t *testing.T) {
 
 	cases := []struct {
 		testID       string
-		start        string
+		start        storj.NodeID
 		limit        int
 		restrictions []pb.Restriction
 		expected     []*pb.Node
 	}{
 		{testID: "one",
-			start: "BBBBB",
+			start: nodeIDB,
 			limit: 2,
 			restrictions: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_GT,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(2),
 				},
 			},
 			expected: nodes[2:],
 		},
 		{testID: "two",
-			start: "AAAAA",
+			start: nodeIDA,
 			limit: 3,
 			restrictions: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_GT,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(2),
 				},
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_LT,
-					Operand:  pb.Restriction_freeDisk,
+					Operand:  pb.Restriction_FREE_DISK,
 					Value:    int64(2),
 				},
 			},
 			expected: nodes[3:],
 		},
 		{testID: "three",
-			start:        "AAAAA",
+			start:        nodeIDA,
 			limit:        4,
 			restrictions: []pb.Restriction{},
 			expected:     nodes,
@@ -298,11 +318,11 @@ func TestGetNodes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.testID, func(t *testing.T) {
-			ns, err := k.GetNodes(context.Background(), c.start, c.limit, c.restrictions...)
+			ns, err := k.GetNodes(ctx, c.start, c.limit, c.restrictions...)
 			assert.NoError(t, err)
 			assert.Equal(t, len(c.expected), len(ns))
 			for i, n := range ns {
-				assert.True(t, proto.Equal(c.expected[i], n))
+				assert.True(t, bytes.Equal(c.expected[i].Id.Bytes(), n.Id.Bytes()))
 			}
 		})
 	}
@@ -317,9 +337,9 @@ func TestMeetsRestrictions(t *testing.T) {
 	}{
 		{testID: "pass one",
 			r: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_EQ,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(1),
 				},
 			},
@@ -332,14 +352,14 @@ func TestMeetsRestrictions(t *testing.T) {
 		},
 		{testID: "pass multiple",
 			r: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_LTE,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(2),
 				},
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_GTE,
-					Operand:  pb.Restriction_freeDisk,
+					Operand:  pb.Restriction_FREE_DISK,
 					Value:    int64(2),
 				},
 			},
@@ -353,14 +373,14 @@ func TestMeetsRestrictions(t *testing.T) {
 		},
 		{testID: "fail one",
 			r: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_LT,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(2),
 				},
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_GT,
-					Operand:  pb.Restriction_freeDisk,
+					Operand:  pb.Restriction_FREE_DISK,
 					Value:    int64(2),
 				},
 			},
@@ -374,14 +394,14 @@ func TestMeetsRestrictions(t *testing.T) {
 		},
 		{testID: "fail multiple",
 			r: []pb.Restriction{
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_LT,
-					Operand:  pb.Restriction_freeBandwidth,
+					Operand:  pb.Restriction_FREE_BANDWIDTH,
 					Value:    int64(2),
 				},
-				pb.Restriction{
+				{
 					Operator: pb.Restriction_GT,
-					Operand:  pb.Restriction_freeDisk,
+					Operand:  pb.Restriction_FREE_DISK,
 					Value:    int64(2),
 				},
 			},
@@ -409,4 +429,106 @@ func mktempdir(t *testing.T, dir string) (string, func()) {
 		assert.NoError(t, os.RemoveAll(rootdir))
 	}
 	return rootdir, cleanup
+}
+
+func startTestNodeServer(ctx context.Context) (*grpc.Server, *mockNodesServer, *provider.FullIdentity, string) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, nil, ""
+	}
+
+	ca, err := testidentity.NewTestCA(ctx)
+	if err != nil {
+		return nil, nil, nil, ""
+	}
+	identity, err := ca.NewIdentity()
+	if err != nil {
+		return nil, nil, nil, ""
+	}
+	identOpt, err := identity.ServerOption()
+	if err != nil {
+		return nil, nil, nil, ""
+	}
+	grpcServer := grpc.NewServer(identOpt)
+	mn := &mockNodesServer{queryCalled: 0}
+
+	pb.RegisterNodesServer(grpcServer, mn)
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			return
+		}
+	}()
+
+	return grpcServer, mn, identity, lis.Addr().String()
+}
+
+func newTestServer(ctx context.Context, nn []*pb.Node) (*grpc.Server, *mockNodesServer) {
+
+	ca, err := testidentity.NewTestCA(ctx)
+	if err != nil {
+		return nil, nil
+	}
+	identity, err := ca.NewIdentity()
+	if err != nil {
+		return nil, nil
+	}
+	identOpt, err := identity.ServerOption()
+	if err != nil {
+		return nil, nil
+	}
+	grpcServer := grpc.NewServer(identOpt)
+	mn := &mockNodesServer{queryCalled: 0}
+
+	pb.RegisterNodesServer(grpcServer, mn)
+
+	return grpcServer, mn
+}
+
+// TestRandomIds makes sure finds a random node ID is within a range (start..end]
+func TestRandomIds(t *testing.T) {
+	for x := 0; x < 1000; x++ {
+		var start, end bucketID
+		// many valid options
+		rand.Read(start[:])
+		rand.Read(end[:])
+		if bytes.Compare(start[:], end[:]) > 0 {
+			start, end = end, start
+		}
+		id, err := randomIDInRange(start, end)
+		assert.NoError(t, err, "Unexpected err in randomIDInRange")
+		assert.True(t, bytes.Compare(id[:], start[:]) > 0, "Random id was less than starting id")
+		assert.True(t, bytes.Compare(id[:], end[:]) <= 0, "Random id was greater than end id")
+		//invalid range
+		_, err = randomIDInRange(end, start)
+		assert.Error(t, err, "Missing expected err in invalid randomIDInRange")
+		//no valid options
+		end = start
+		_, err = randomIDInRange(start, end)
+		assert.Error(t, err, "Missing expected err in empty randomIDInRange")
+		// one valid option
+		if start[31] == 255 {
+			start[31] = 254
+		} else {
+			end[31] = start[31] + 1
+		}
+		id, err = randomIDInRange(start, end)
+		assert.NoError(t, err, "Unexpected err in randomIDInRange")
+		assert.True(t, bytes.Equal(id[:], end[:]), "Not-so-random id was incorrect")
+	}
+}
+
+type mockNodesServer struct {
+	queryCalled int32
+	pingCalled  int32
+	returnValue []*pb.Node
+}
+
+func (mn *mockNodesServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.QueryResponse, error) {
+	atomic.AddInt32(&mn.queryCalled, 1)
+	return &pb.QueryResponse{Response: mn.returnValue}, nil
+}
+
+func (mn *mockNodesServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
+	atomic.AddInt32(&mn.pingCalled, 1)
+	return &pb.PingResponse{}, nil
 }

@@ -5,11 +5,11 @@ FROM storjlabs/golang as build-env
 
 # final stage
 FROM alpine
-ENV CONF_PATH=/root/.storj/storagenode/config.yaml \
+ENV CONF_PATH=/root/.local/share/storj/storagenode \
     SATELLITE_ADDR=
-EXPOSE 7776/udp \
-       7777
+EXPOSE 28967
 WORKDIR /app
+VOLUME /root/.local/share/storj/storagenode
 COPY --from=build-env /app /app/storagenode
 COPY cmd/storagenode/entrypoint /entrypoint
 ENTRYPOINT ["/entrypoint"]

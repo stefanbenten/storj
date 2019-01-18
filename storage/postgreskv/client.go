@@ -10,7 +10,6 @@ import (
 	"github.com/lib/pq"
 	"github.com/zeebo/errs"
 
-	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/postgreskv/schema"
 )
@@ -50,7 +49,7 @@ func (client *Client) Put(key storage.Key, value storage.Value) error {
 // PutPath sets the value for the provided key (in the given bucket).
 func (client *Client) PutPath(bucket, key storage.Key, value storage.Value) error {
 	if key.IsZero() {
-		return Error.New("invalid key")
+		return storage.ErrEmptyKey.New("")
 	}
 	q := `
 		INSERT INTO pathdata (bucket, fullpath, metadata)
@@ -68,6 +67,10 @@ func (client *Client) Get(key storage.Key) (storage.Value, error) {
 
 // GetPath looks up the provided key (in the given bucket) and returns its value (or an error).
 func (client *Client) GetPath(bucket, key storage.Key) (storage.Value, error) {
+	if key.IsZero() {
+		return nil, storage.ErrEmptyKey.New("")
+	}
+
 	q := "SELECT metadata FROM pathdata WHERE bucket = $1::BYTEA AND fullpath = $2::BYTEA"
 	row := client.pgConn.QueryRow(q, []byte(bucket), []byte(key))
 	var val []byte
@@ -88,6 +91,10 @@ func (client *Client) Delete(key storage.Key) error {
 
 // DeletePath deletes the given key (in the given bucket) and its associated value.
 func (client *Client) DeletePath(bucket, key storage.Key) error {
+	if key.IsZero() {
+		return storage.ErrEmptyKey.New("")
+	}
+
 	q := "DELETE FROM pathdata WHERE bucket = $1::BYTEA AND fullpath = $2::BYTEA"
 	result, err := client.pgConn.Exec(q, []byte(bucket), []byte(key))
 	if err != nil {
@@ -149,11 +156,11 @@ func (client *Client) GetAllPath(bucket storage.Key, keys storage.Keys) (storage
 	for rows.Next() {
 		var value []byte
 		if err := rows.Scan(&value); err != nil {
-			return nil, errs.Wrap(utils.CombineErrors(err, rows.Close()))
+			return nil, errs.Wrap(errs.Combine(err, rows.Close()))
 		}
 		values = append(values, storage.Value(value))
 	}
-	return values, utils.CombineErrors(rows.Err(), rows.Close())
+	return values, errs.Combine(rows.Err(), rows.Close())
 }
 
 type orderedPostgresIterator struct {
@@ -200,7 +207,7 @@ func (opi *orderedPostgresIterator) Next(item *storage.ListItem) bool {
 	var k, v []byte
 	err := opi.curRows.Scan(&k, &v)
 	if err != nil {
-		opi.errEncountered = utils.CombineErrors(errs.Wrap(err), errs.Wrap(opi.curRows.Close()))
+		opi.errEncountered = errs.Combine(errs.Wrap(err), errs.Wrap(opi.curRows.Close()))
 		return false
 	}
 	item.Key = storage.Key(k)
@@ -254,7 +261,7 @@ func (opi *orderedPostgresIterator) doNextQuery() (*sql.Rows, error) {
 }
 
 func (opi *orderedPostgresIterator) Close() error {
-	return utils.CombineErrors(opi.errEncountered, opi.curRows.Close())
+	return errs.Combine(opi.errEncountered, opi.curRows.Close())
 }
 
 func newOrderedPostgresIterator(pgClient *Client, opts storage.IterateOptions, batchSize int) (*orderedPostgresIterator, error) {
@@ -288,7 +295,7 @@ func (client *Client) Iterate(opts storage.IterateOptions, fn func(storage.Itera
 		return err
 	}
 	defer func() {
-		err = utils.CombineErrors(err, opi.Close())
+		err = errs.Combine(err, opi.Close())
 	}()
 
 	return fn(opi)

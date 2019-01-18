@@ -6,45 +6,85 @@ package testplanet
 
 import (
 	"context"
+	"errors"
+	"io"
 	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/zeebo/errs"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 	"google.golang.org/grpc"
 
 	"storj.io/storj/internal/memory"
-	"storj.io/storj/pkg/auth/grpcauth"
+	"storj.io/storj/pkg/kademlia"
+	"storj.io/storj/pkg/node"
+	"storj.io/storj/pkg/overlay"
 	"storj.io/storj/pkg/pb"
-	pieceserver "storj.io/storj/pkg/piecestore/rpc/server"
-	"storj.io/storj/pkg/piecestore/rpc/server/psdb"
+	"storj.io/storj/pkg/piecestore/psserver"
 	"storj.io/storj/pkg/pointerdb"
 	"storj.io/storj/pkg/provider"
-	"storj.io/storj/pkg/transport"
+	"storj.io/storj/pkg/storj"
 	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage/teststore"
+	"storj.io/storj/storagenode"
+	"storj.io/storj/storagenode/storagenodedb"
 )
+
+// Peer represents one of StorageNode or Satellite
+type Peer interface {
+	ID() storj.NodeID
+	Addr() string
+	Local() pb.Node
+
+	Run(context.Context) error
+	Close() error
+
+	NewNodeClient() (node.Client, error)
+}
 
 // Planet is a full storj system setup.
 type Planet struct {
+	log       *zap.Logger
 	directory string // TODO: ensure that everything is in-memory to speed things up
+	started   bool
+
+	peers     []Peer
+	databases []io.Closer
 
 	nodeInfos []pb.Node
 	nodeLinks []string
 	nodes     []*Node
 
 	Satellites   []*Node
-	StorageNodes []*Node
+	StorageNodes []*storagenode.Peer
 	Uplinks      []*Node
 
 	identities *Identities
 }
 
 // New creates a new full system with the given number of nodes.
-func New(satelliteCount, storageNodeCount, uplinkCount int) (*Planet, error) {
+func New(t zaptest.TestingT, satelliteCount, storageNodeCount, uplinkCount int) (*Planet, error) {
+	var log *zap.Logger
+	if t == nil {
+		log = zap.NewNop()
+	} else {
+		log = zaptest.NewLogger(t)
+	}
+
+	return NewWithLogger(log, satelliteCount, storageNodeCount, uplinkCount)
+}
+
+// NewWithLogger creates a new full system with the given number of nodes.
+func NewWithLogger(log *zap.Logger, satelliteCount, storageNodeCount, uplinkCount int) (*Planet, error) {
 	planet := &Planet{
-		identities: pregeneratedIdentities.Clone(),
+		log:        log,
+		identities: NewPregeneratedIdentities(),
 	}
 
 	var err error
@@ -53,69 +93,85 @@ func New(satelliteCount, storageNodeCount, uplinkCount int) (*Planet, error) {
 		return nil, err
 	}
 
-	planet.Satellites, err = planet.newNodes(satelliteCount)
+	planet.Satellites, err = planet.newNodes("satellite", satelliteCount, pb.NodeType_SATELLITE)
 	if err != nil {
 		return nil, utils.CombineErrors(err, planet.Shutdown())
 	}
 
-	planet.StorageNodes, err = planet.newNodes(storageNodeCount)
+	planet.StorageNodes, err = planet.newStorageNodes(storageNodeCount)
 	if err != nil {
 		return nil, utils.CombineErrors(err, planet.Shutdown())
 	}
 
-	planet.Uplinks, err = planet.newNodes(uplinkCount)
+	planet.Uplinks, err = planet.newNodes("uplink", uplinkCount, pb.NodeType_UPLINK)
 	if err != nil {
 		return nil, utils.CombineErrors(err, planet.Shutdown())
 	}
 
 	for _, node := range planet.nodes {
-		err := node.initOverlay(planet)
+		err = node.initOverlay(planet)
 		if err != nil {
 			return nil, utils.CombineErrors(err, planet.Shutdown())
 		}
 	}
 
+	for _, n := range planet.nodes {
+		server := node.NewServer(n.Log.Named("node"), n.Kademlia)
+		pb.RegisterNodesServer(n.Provider.GRPC(), server)
+		// TODO: shutdown
+	}
+
 	// init Satellites
 	for _, node := range planet.Satellites {
-		server := pointerdb.NewServer(
-			teststore.New(), node.Overlay,
-			zap.NewNop(),
+		pointerServer := pointerdb.NewServer(
+			teststore.New(),
+			node.Overlay,
+			node.Log.Named("pdb"),
 			pointerdb.Config{
 				MinRemoteSegmentSize: 1240,
 				MaxInlineSegmentSize: 8000,
 				Overlay:              true,
 			},
 			node.Identity)
-		pb.RegisterPointerDBServer(node.Provider.GRPC(), server)
+		pb.RegisterPointerDBServer(node.Provider.GRPC(), pointerServer)
+		// bootstrap satellite kademlia node
+		go func(n *Node) {
+			if err := n.Kademlia.Bootstrap(context.Background()); err != nil {
+				log.Error(err.Error())
+			}
+		}(node)
+
+		ns := &pb.NodeStats{
+			UptimeCount:       0,
+			UptimeRatio:       0,
+			AuditSuccessRatio: 0,
+			AuditCount:        0,
+		}
+
+		overlayServer := overlay.NewServer(node.Log.Named("overlay"), node.Overlay, ns)
+		pb.RegisterOverlayServer(node.Provider.GRPC(), overlayServer)
 
 		node.Dependencies = append(node.Dependencies,
 			closerFunc(func() error {
 				// TODO: implement
 				return nil
 			}))
+
+		go func(n *Node) {
+			// refresh the interval every 500ms
+			t := time.NewTicker(500 * time.Millisecond).C
+			for {
+				<-t
+				if err := n.Discovery.Refresh(context.Background()); err != nil {
+					log.Error(err.Error())
+				}
+			}
+		}(node)
 	}
 
 	// init storage nodes
-	for _, node := range planet.StorageNodes {
-		storageDir := filepath.Join(planet.directory, node.ID())
-
-		serverdb, err := psdb.OpenInMemory(context.Background(), storageDir)
-		if err != nil {
-			return nil, utils.CombineErrors(err, planet.Shutdown())
-		}
-
-		server := pieceserver.New(storageDir, serverdb, pieceserver.Config{
-			Path:               storageDir,
-			AllocatedDiskSpace: memory.GB.Int64(),
-			AllocatedBandwidth: 100 * memory.GB.Int64(),
-		}, node.Identity.Key)
-
-		pb.RegisterPieceStoreRoutesServer(node.Provider.GRPC(), server)
-
-		node.Dependencies = append(node.Dependencies,
-			closerFunc(func() error {
-				return server.Stop(context.Background())
-			}))
+	for _, storageNode := range planet.StorageNodes {
+		storageNode.Kademlia.SetBootstrapNodes(planet.nodeInfos)
 	}
 
 	// init Uplinks
@@ -131,6 +187,7 @@ func New(satelliteCount, storageNodeCount, uplinkCount int) (*Planet, error) {
 func (planet *Planet) Start(ctx context.Context) {
 	for _, node := range planet.nodes {
 		go func(node *Node) {
+			node.Kademlia.StartRefresh(ctx)
 			err := node.Provider.Run(ctx)
 			if err == grpc.ErrServerStopped {
 				err = nil
@@ -141,64 +198,55 @@ func (planet *Planet) Start(ctx context.Context) {
 			}
 		}(node)
 	}
+
+	for _, peer := range planet.peers {
+		go func(peer Peer) {
+			err := peer.Run(ctx)
+			if err == grpc.ErrServerStopped {
+				err = nil
+			}
+			if err != nil {
+				// TODO: better error handling
+				panic(err)
+			}
+		}(peer)
+	}
+
+	planet.started = true
 }
+
+// Size returns number of nodes in the network
+func (planet *Planet) Size() int { return len(planet.nodes) + len(planet.peers) }
 
 // Shutdown shuts down all the nodes and deletes temporary directories.
 func (planet *Planet) Shutdown() error {
-	var errs []error
+	var errlist errs.Group
+	if !planet.started {
+		errlist.Add(errors.New("Start was never called"))
+	}
+
 	// shutdown in reverse order
 	for i := len(planet.nodes) - 1; i >= 0; i-- {
 		node := planet.nodes[i]
-		errs = append(errs, node.Shutdown())
+		errlist.Add(node.Shutdown())
 	}
-	errs = append(errs, os.RemoveAll(planet.directory))
-	return utils.CombineErrors(errs...)
-}
-
-// newNode creates a new node.
-func (planet *Planet) newNode() (*Node, error) {
-	identity, err := planet.newIdentity()
-	if err != nil {
-		return nil, err
+	for i := len(planet.peers) - 1; i >= 0; i-- {
+		peer := planet.peers[i]
+		errlist.Add(peer.Close())
+	}
+	for _, db := range planet.databases {
+		errlist.Add(db.Close())
 	}
 
-	listener, err := planet.newListener()
-	if err != nil {
-		return nil, err
-	}
-
-	node := &Node{
-		Identity: identity,
-		Listener: listener,
-	}
-
-	node.Transport = transport.NewClient(identity)
-
-	node.Provider, err = provider.NewProvider(node.Identity, node.Listener, grpcauth.NewAPIKeyInterceptor())
-	if err != nil {
-		return nil, utils.CombineErrors(err, listener.Close())
-	}
-
-	node.Info = pb.Node{
-		Id: node.Identity.ID.String(),
-		Address: &pb.NodeAddress{
-			Transport: pb.NodeTransport_TCP_TLS_GRPC,
-			Address:   node.Listener.Addr().String(),
-		},
-	}
-
-	planet.nodes = append(planet.nodes, node)
-	planet.nodeInfos = append(planet.nodeInfos, node.Info)
-	planet.nodeLinks = append(planet.nodeLinks, node.Info.Id+":"+node.Listener.Addr().String())
-
-	return node, nil
+	errlist.Add(os.RemoveAll(planet.directory))
+	return errlist.Err()
 }
 
 // newNodes creates initializes multiple nodes
-func (planet *Planet) newNodes(count int) ([]*Node, error) {
+func (planet *Planet) newNodes(prefix string, count int, nodeType pb.NodeType) ([]*Node, error) {
 	var xs []*Node
 	for i := 0; i < count; i++ {
-		node, err := planet.newNode()
+		node, err := planet.newNode(prefix+strconv.Itoa(i), nodeType)
 		if err != nil {
 			return nil, err
 		}
@@ -208,8 +256,62 @@ func (planet *Planet) newNodes(count int) ([]*Node, error) {
 	return xs, nil
 }
 
-// newIdentity creates a new identity for a node
-func (planet *Planet) newIdentity() (*provider.FullIdentity, error) {
+// newStorageNodes initializes storage nodes
+func (planet *Planet) newStorageNodes(count int) ([]*storagenode.Peer, error) {
+	var xs []*storagenode.Peer
+	defer func() {
+		for _, x := range xs {
+			planet.peers = append(planet.peers, x)
+			planet.nodeInfos = append(planet.nodeInfos, x.Local())
+		}
+	}()
+
+	for i := 0; i < count; i++ {
+		prefix := "storage" + strconv.Itoa(i)
+		log := planet.log.Named(prefix)
+		storageDir := filepath.Join(planet.directory, prefix)
+
+		identity, err := planet.NewIdentity()
+		if err != nil {
+			return nil, err
+		}
+
+		db, err := storagenodedb.NewInMemory(storageDir)
+		if err != nil {
+			return nil, err
+		}
+		planet.databases = append(planet.databases, db)
+
+		config := storagenode.Config{
+			PublicAddress: "127.0.0.1:0",
+			Kademlia: kademlia.Config{
+				Alpha: 5,
+				Operator: kademlia.OperatorConfig{
+					Email:  prefix + "@example.com",
+					Wallet: "0x" + strings.Repeat("00", 20),
+				},
+			},
+			Storage: psserver.Config{
+				Path:                   "", // TODO: this argument won't be needed with master storagenodedb
+				AllocatedDiskSpace:     memory.TB,
+				AllocatedBandwidth:     memory.TB,
+				KBucketRefreshInterval: time.Minute,
+			},
+		}
+
+		peer, err := storagenode.New(log, identity, db, config)
+		if err != nil {
+			return xs, err
+		}
+
+		log.Debug("id=" + peer.ID().String() + " addr=" + peer.Addr())
+		xs = append(xs, peer)
+	}
+	return xs, nil
+}
+
+// NewIdentity creates a new identity for a node
+func (planet *Planet) NewIdentity() (*provider.FullIdentity, error) {
 	return planet.identities.NewIdentity()
 }
 

@@ -4,46 +4,31 @@
 package main
 
 import (
-	"net/url"
-	"strconv"
+	"context"
+	"fmt"
 
-	"go.uber.org/zap"
+	"github.com/zeebo/errs"
 
 	"storj.io/storj/pkg/overlay"
+	"storj.io/storj/satellite/satellitedb"
 )
 
 type cacheConfig struct {
-	NodesPath   string `help:"the path to a JSON file containing an object with IP keys and nodeID values"`
-	DatabaseURL string `help:"the database connection string to use"`
+	NodesPath string `help:"the path to a JSON file containing an object with IP keys and nodeID values"`
+	Database  string `help:"overlay database connection string" default:"sqlite3://$CONFDIR/master.db"`
 }
 
-func (c cacheConfig) open() (*overlay.Cache, error) {
-	dburl, err := url.Parse(c.DatabaseURL)
+func (c cacheConfig) open(ctx context.Context) (cache *overlay.Cache, dbClose func(), err error) {
+	database, err := satellitedb.New(c.Database)
 	if err != nil {
-		return nil, Error.Wrap(err)
+		return nil, nil, errs.New("error connecting to database: %+v", err)
+	}
+	dbClose = func() {
+		err := database.Close()
+		if err != nil {
+			fmt.Printf("error closing connection to database: %+v\n", err)
+		}
 	}
 
-	var cache *overlay.Cache
-	switch dburl.Scheme {
-	case "bolt":
-		cache, err = overlay.NewBoltOverlayCache(dburl.Path, nil)
-		if err != nil {
-			return nil, err
-		}
-		zap.S().Info("Starting overlay cache with BoltDB")
-	case "redis":
-		db, err := strconv.Atoi(dburl.Query().Get("db"))
-		if err != nil {
-			return nil, Error.New("invalid db: %s", err)
-		}
-		cache, err = overlay.NewRedisOverlayCache(dburl.Host, overlay.GetUserPassword(dburl), db, nil)
-		if err != nil {
-			return nil, err
-		}
-		zap.S().Info("Starting overlay cache with Redis")
-	default:
-		return nil, Error.New("database scheme not supported: %s", dburl.Scheme)
-	}
-
-	return cache, nil
+	return overlay.NewCache(database.OverlayCache(), database.StatDB()), dbClose, nil
 }

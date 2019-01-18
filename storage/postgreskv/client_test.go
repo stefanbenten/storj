@@ -13,7 +13,6 @@ import (
 	"github.com/zeebo/errs"
 	"go.uber.org/zap/zaptest"
 
-	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage"
 	"storj.io/storj/storage/storelogger"
 	"storj.io/storj/storage/testsuite"
@@ -21,11 +20,11 @@ import (
 
 const (
 	// this connstring is expected to work under the storj-test docker-compose instance
-	defaultPostgresConn = "postgres://pointerdb:pg-secret-pass@test-postgres-pointerdb/pointerdb?sslmode=disable"
+	defaultPostgresConn = "postgres://storj:storj-pass@test-postgres/teststorj?sslmode=disable"
 )
 
 var (
-	testPostgres = flag.String("postgres-test-db", os.Getenv("STORJ_POSTGRESKV_TEST"), "PostgreSQL test database connection string")
+	testPostgres = flag.String("postgres-test-db", os.Getenv("STORJ_POSTGRES_TEST"), "PostgreSQL test database connection string")
 )
 
 func newTestPostgres(t testing.TB) (store *Client, cleanup func()) {
@@ -67,9 +66,9 @@ func bulkImport(db *sql.DB, iter storage.Iterator) (err error) {
 	}
 	defer func() {
 		if err == nil {
-			err = utils.CombineErrors(err, txn.Commit())
+			err = errs.Combine(err, txn.Commit())
 		} else {
-			err = utils.CombineErrors(err, txn.Rollback())
+			err = errs.Combine(err, txn.Rollback())
 		}
 	}()
 
@@ -80,7 +79,7 @@ func bulkImport(db *sql.DB, iter storage.Iterator) (err error) {
 	defer func() {
 		err2 := stmt.Close()
 		if err2 != nil {
-			err = utils.CombineErrors(err, errs.New("Failed to close COPY FROM statement: %v", err2))
+			err = errs.Combine(err, errs.New("Failed to close COPY FROM statement: %v", err2))
 		}
 	}()
 

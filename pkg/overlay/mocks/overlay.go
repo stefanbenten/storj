@@ -12,22 +12,30 @@ import (
 
 	"storj.io/storj/pkg/pb"
 	"storj.io/storj/pkg/provider"
+	"storj.io/storj/pkg/storj"
 )
 
 // Overlay is a mocked overlay implementation
 type Overlay struct {
-	nodes map[string]*pb.Node
+	nodes map[storj.NodeID]*pb.Node
 }
 
 // NewOverlay returns a newly initialized mock overlal
 func NewOverlay(nodes []*pb.Node) *Overlay {
-	rv := &Overlay{nodes: map[string]*pb.Node{}}
+	rv := &Overlay{nodes: map[storj.NodeID]*pb.Node{}}
 	for _, node := range nodes {
 		rv.nodes[node.Id] = node
 	}
 	return rv
 
 }
+
+//CtxKey Used as kademlia key
+type CtxKey int
+
+const (
+	ctxKeyMockOverlay CtxKey = iota
+)
 
 // FindStorageNodes is the mock implementation
 func (mo *Overlay) FindStorageNodes(ctx context.Context, req *pb.FindStorageNodesRequest) (resp *pb.FindStorageNodesResponse, err error) {
@@ -36,7 +44,7 @@ func (mo *Overlay) FindStorageNodes(ctx context.Context, req *pb.FindStorageNode
 		nodes = append(nodes, node)
 	}
 	if int64(len(nodes)) < req.Opts.GetAmount() {
-		return nil, errs.New("not enough farmers exist")
+		return nil, errs.New("not enough storage nodes exist")
 	}
 	nodes = nodes[:req.Opts.GetAmount()]
 	return &pb.FindStorageNodesResponse{Nodes: nodes}, nil
@@ -45,20 +53,20 @@ func (mo *Overlay) FindStorageNodes(ctx context.Context, req *pb.FindStorageNode
 // Lookup finds a single storage node based on the request
 func (mo *Overlay) Lookup(ctx context.Context, req *pb.LookupRequest) (
 	*pb.LookupResponse, error) {
-	return &pb.LookupResponse{Node: mo.nodes[req.NodeID]}, nil
+	return &pb.LookupResponse{Node: mo.nodes[req.NodeId]}, nil
 }
 
 //BulkLookup finds multiple storage nodes based on the requests
 func (mo *Overlay) BulkLookup(ctx context.Context, reqs *pb.LookupRequests) (
 	*pb.LookupResponses, error) {
 	var responses []*pb.LookupResponse
-	for _, r := range reqs.Lookuprequest {
+	for _, r := range reqs.LookupRequest {
 		// NOTE (Dylan): tests did not catch missing node case, need updating
-		n := mo.nodes[r.NodeID]
+		n := mo.nodes[r.NodeId]
 		resp := &pb.LookupResponse{Node: n}
 		responses = append(responses, resp)
 	}
-	return &pb.LookupResponses{Lookupresponse: responses}, nil
+	return &pb.LookupResponses{LookupResponse: responses}, nil
 }
 
 // Config specifies static nodes for mock overlay
@@ -74,7 +82,11 @@ func (c Config) Run(ctx context.Context, server *provider.Provider) error {
 		if len(parts) != 2 {
 			return fmt.Errorf("malformed node config: %#v", nodestr)
 		}
-		id, addr := parts[0], parts[1]
+		id, err := storj.NodeIDFromString(parts[0])
+		if err != nil {
+			return err
+		}
+		addr := parts[1]
 		nodes = append(nodes, &pb.Node{
 			Id: id,
 			Address: &pb.NodeAddress{
@@ -82,7 +94,16 @@ func (c Config) Run(ctx context.Context, server *provider.Provider) error {
 				Address:   addr,
 			}})
 	}
-
-	pb.RegisterOverlayServer(server.GRPC(), NewOverlay(nodes))
+	srv := NewOverlay(nodes)
+	pb.RegisterOverlayServer(server.GRPC(), srv)
+	ctx = context.WithValue(ctx, ctxKeyMockOverlay, srv)
 	return server.Run(ctx)
+}
+
+// LoadServerFromContext gives access to the overlay server from the context, or returns nil
+func LoadServerFromContext(ctx context.Context) *Overlay {
+	if v, ok := ctx.Value(ctxKeyMockOverlay).(*Overlay); ok {
+		return v
+	}
+	return nil
 }

@@ -15,64 +15,53 @@ import (
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/pkg/hash"
 
-	"storj.io/storj/pkg/storage/objects"
+	"storj.io/storj/pkg/storj"
 )
 
-func (s *storjObjects) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string) (uploadID string, err error) {
+func (layer *gatewayLayer) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string) (uploadID string, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	uploads := s.storj.multipart
+	// Check that the bucket exists
+	_, err = layer.gateway.metainfo.GetBucket(ctx, bucket)
+	if err != nil {
+		return "", convertError(err, bucket, "")
+	}
+
+	uploads := layer.gateway.multipart
 
 	upload, err := uploads.Create(bucket, object, metadata)
 	if err != nil {
 		return "", err
 	}
 
-	objectStore, err := s.storj.bs.GetObjectStore(ctx, bucket)
-	if err != nil {
-		uploads.RemoveByID(upload.ID)
-		upload.fail(err)
-		return "", err
-	}
-
 	go func() {
-		// setting zero value means the object never expires
-		expTime := time.Time{}
-
-		tempContType := metadata["content-type"]
+		contentType := metadata["content-type"]
 		delete(metadata, "content-type")
 
-		//metadata serialized
-		serMetaInfo := objects.SerializableMeta{
-			ContentType: tempContType,
-			UserDefined: metadata,
+		createInfo := storj.CreateObject{
+			ContentType:      contentType,
+			Metadata:         metadata,
+			RedundancyScheme: layer.gateway.redundancy,
+			EncryptionScheme: layer.gateway.encryption,
 		}
+		objInfo, err := layer.putObject(ctx, bucket, object, upload.Stream, &createInfo)
 
-		result, err := objectStore.Put(ctx, object, upload.Stream, serMetaInfo, expTime)
 		uploads.RemoveByID(upload.ID)
 
 		if err != nil {
 			upload.fail(err)
 		} else {
-			upload.complete(minio.ObjectInfo{
-				Name:        object,
-				Bucket:      bucket,
-				ModTime:     result.Modified,
-				Size:        result.Size,
-				ETag:        result.Checksum,
-				ContentType: result.ContentType,
-				UserDefined: result.UserDefined,
-			})
+			upload.complete(objInfo)
 		}
 	}()
 
 	return upload.ID, nil
 }
 
-func (s *storjObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *hash.Reader) (info minio.PartInfo, err error) {
+func (layer *gatewayLayer) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *hash.Reader) (info minio.PartInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	uploads := s.storj.multipart
+	uploads := layer.gateway.multipart
 
 	upload, err := uploads.Get(bucket, object, uploadID)
 	if err != nil {
@@ -101,10 +90,10 @@ func (s *storjObjects) PutObjectPart(ctx context.Context, bucket, object, upload
 	return partInfo, nil
 }
 
-func (s *storjObjects) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
+func (layer *gatewayLayer) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	uploads := s.storj.multipart
+	uploads := layer.gateway.multipart
 
 	upload, err := uploads.Remove(bucket, object, uploadID)
 	if err != nil {
@@ -120,10 +109,10 @@ func (s *storjObjects) AbortMultipartUpload(ctx context.Context, bucket, object,
 	return nil
 }
 
-func (s *storjObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart) (objInfo minio.ObjectInfo, err error) {
+func (layer *gatewayLayer) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart) (objInfo minio.ObjectInfo, err error) {
 	defer mon.Task()(&ctx)(&err)
 
-	uploads := s.storj.multipart
+	uploads := layer.gateway.multipart
 	upload, err := uploads.Remove(bucket, object, uploadID)
 	if err != nil {
 		return minio.ObjectInfo{}, err
@@ -137,8 +126,10 @@ func (s *storjObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 	return result.Info, result.Error
 }
 
-func (s *storjObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (result minio.ListPartsInfo, err error) {
-	uploads := s.storj.multipart
+func (layer *gatewayLayer) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (result minio.ListPartsInfo, err error) {
+	defer mon.Task()(&ctx)(&err)
+
+	uploads := layer.gateway.multipart
 	upload, err := uploads.Get(bucket, object, uploadID)
 	if err != nil {
 		return minio.ListPartsInfo{}, err
@@ -177,8 +168,8 @@ func (s *storjObjects) ListObjectParts(ctx context.Context, bucket, object, uplo
 }
 
 // TODO: implement
-// func (s *storjObjects) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result minio.ListMultipartsInfo, err error) {
-// func (s *storjObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo minio.ObjectInfo) (info minio.PartInfo, err error) {
+// func (layer *gatewayLayer) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result minio.ListMultipartsInfo, err error) {
+// func (layer *gatewayLayer) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo minio.ObjectInfo) (info minio.PartInfo, err error) {
 
 // MultipartUploads manages pending multipart uploads
 type MultipartUploads struct {
@@ -317,14 +308,15 @@ func (upload *MultipartUpload) complete(info minio.ObjectInfo) {
 
 // MultipartStream serializes multiple readers into a single reader
 type MultipartStream struct {
-	mu         sync.Mutex
-	moreParts  sync.Cond
-	err        error
-	closed     bool
-	finished   bool
-	nextID     int
-	nextNumber int
-	parts      []*StreamPart
+	mu          sync.Mutex
+	moreParts   sync.Cond
+	err         error
+	closed      bool
+	finished    bool
+	nextID      int
+	nextNumber  int
+	currentPart *StreamPart
+	parts       []*StreamPart
 }
 
 // StreamPart is a reader waiting in MultipartStream
@@ -379,7 +371,6 @@ func (stream *MultipartStream) Close() {
 
 // Read implements io.Reader interface, blocking when there's no part
 func (stream *MultipartStream) Read(data []byte) (n int, err error) {
-	var part *StreamPart
 	stream.mu.Lock()
 	for {
 		// has an error occurred?
@@ -387,9 +378,15 @@ func (stream *MultipartStream) Read(data []byte) (n int, err error) {
 			stream.mu.Unlock()
 			return 0, Error.Wrap(err)
 		}
+		// still uploading the current part?
+		if stream.currentPart != nil {
+			break
+		}
 		// do we have the next part?
 		if len(stream.parts) > 0 && stream.nextID == stream.parts[0].ID {
-			part = stream.parts[0]
+			stream.currentPart = stream.parts[0]
+			stream.parts = stream.parts[1:]
+			stream.nextID++
 			break
 		}
 		// we don't have the next part and are closed, hence we are complete
@@ -404,19 +401,14 @@ func (stream *MultipartStream) Read(data []byte) (n int, err error) {
 	stream.mu.Unlock()
 
 	// read as much as we can
-	n, err = part.Reader.Read(data)
-	atomic.AddInt64(&part.Size, int64(n))
+	n, err = stream.currentPart.Reader.Read(data)
+	atomic.AddInt64(&stream.currentPart.Size, int64(n))
 
 	if err == io.EOF {
 		// the part completed, hence advance to the next one
 		err = nil
-
-		stream.mu.Lock()
-		stream.parts = stream.parts[1:]
-		stream.nextID++
-		stream.mu.Unlock()
-
-		close(part.Done)
+		close(stream.currentPart.Done)
+		stream.currentPart = nil
 	} else if err != nil {
 		// something bad happened, abort the whole thing
 		stream.Abort(err)
@@ -431,9 +423,17 @@ func (stream *MultipartStream) AddPart(partID int, data *hash.Reader) (*StreamPa
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 
+	if partID < stream.nextID {
+		return nil, Error.New("part %d already uploaded, next part ID is %d", partID, stream.nextID)
+	}
+
 	for _, p := range stream.parts {
 		if p.ID == partID {
-			return nil, Error.New("Part %d already exists", partID)
+			// Replace the reader of this part with the new one.
+			// This could happen if the read timeout for this part has expired
+			// and the client tries to upload the part again.
+			p.Reader = data
+			return p, nil
 		}
 	}
 

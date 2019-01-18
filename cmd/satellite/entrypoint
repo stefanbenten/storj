@@ -1,28 +1,41 @@
 #!/bin/sh
 set -euo pipefail
 
-if [[ ! -f "${CONF_PATH}" ]]; then
-	./satellite setup
-fi
+SETUP_PARAMS=""
 
-RUN_PARAMS="${RUN_PARAMS:-} --config ${CONF_PATH}"
+if [[ -n "${API_KEY:-}" ]]; then
+	export STORJ_POINTER_DB_AUTH_API_KEY="${API_KEY}"
+  export STORJ_AUDIT_API_KEY="${API_KEY}"
+  export STORJ_POINTER_DB_AUTH_API_KEY="${API_KEY}"
+  export STORJ_REPAIRER_API_KEY="${API_KEY}"
+fi
 
 if [[ -n "${OVERLAY_URL:-}" ]]; then
-	RUN_PARAMS="${RUN_PARAMS} --overlay.database-url ${OVERLAY_URL}"
+	export STORJ_POINTER_DB_DATABASE_URL="${OVERLAY_URL}"
+else
+  export STORJ_POINTER_DB_DATABASE_URL="${STORJ_DATABASE}"
 fi
 
-RUN_PARAMS="${RUN_PARAMS} --identity.address=${IDENTITY_ADDR}"
 
-if [[ -n "${API_KEY}" ]]; then
-	export STORJ_POINTER_DB_AUTH_API_KEY="${API_KEY}"
+if [[ -n "${IDENTITY_ADDR:-}" ]]; then
+	export STORJ_SERVER_ADDRESS="${IDENTITY_ADDR}"
 fi
 
 if [[ -n "${BOOTSTRAP_ADDR:-}" ]]; then
-	RUN_PARAMS="${RUN_PARAMS} --kademlia.bootstrap-addr ${BOOTSTRAP_ADDR}"
+	export STORJ_KADEMLIA_BOOTSTRAP_ADDR="${BOOTSTRAP_ADDR}"
 fi
 
-if [[ -n "${MOCK_OVERLAY_NODES:-}" ]]; then
-	RUN_PARAMS="${RUN_PARAMS} --mock-overlay.nodes ${MOCK_OVERLAY_NODES}"
+if [[ ! -f "${CONF_PATH}/config.yaml" ]]; then
+	if [[ -n "${CA_DIFFICULTY:-}" ]]; then
+		SETUP_PARAMS="--ca.difficulty ${CA_DIFFICULTY}"
+	fi
+	./satellite setup $SETUP_PARAMS
+fi
+
+RUN_PARAMS="${RUN_PARAMS:-} --config-dir ${CONF_PATH}"
+
+if [[ -n "${BOOTSTRAP_ADDR:-}" ]]; then
+	RUN_PARAMS="${RUN_PARAMS} --kademlia.bootstrap-addr ${BOOTSTRAP_ADDR}"
 fi
 
 exec ./satellite run $RUN_PARAMS "$@"

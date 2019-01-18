@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
+	"github.com/zeebo/errs"
 
-	"storj.io/storj/pkg/utils"
 	"storj.io/storj/storage"
 )
 
@@ -33,17 +33,16 @@ const (
 func New(path, bucket string) (*Client, error) {
 	db, err := bolt.Open(path, fileMode, &bolt.Options{Timeout: defaultTimeout})
 	if err != nil {
-		return nil, err
+		return nil, Error.Wrap(err)
 	}
 
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = Error.Wrap(db.Update(func(tx *bolt.Tx) error {
 		_, err = tx.CreateBucketIfNotExists([]byte(bucket))
 		return err
-	})
-
+	}))
 	if err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			return nil, utils.CombineErrors(err, closeErr)
+		if closeErr := Error.Wrap(db.Close()); closeErr != nil {
+			return nil, errs.Combine(err, closeErr)
 		}
 		return nil, err
 	}
@@ -63,10 +62,10 @@ func New(path, bucket string) (*Client, error) {
 func NewShared(path string, buckets ...string) ([]*Client, error) {
 	db, err := bolt.Open(path, fileMode, &bolt.Options{Timeout: defaultTimeout})
 	if err != nil {
-		return nil, err
+		return nil, Error.Wrap(err)
 	}
 
-	err = db.Update(func(tx *bolt.Tx) error {
+	err = Error.Wrap(db.Update(func(tx *bolt.Tx) error {
 		for _, bucket := range buckets {
 			_, err := tx.CreateBucketIfNotExists([]byte(bucket))
 			if err != nil {
@@ -74,11 +73,10 @@ func NewShared(path string, buckets ...string) ([]*Client, error) {
 			}
 		}
 		return err
-	})
-
+	}))
 	if err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			return nil, utils.CombineErrors(err, closeErr)
+		if closeErr := Error.Wrap(db.Close()); closeErr != nil {
+			return nil, errs.Combine(err, closeErr)
 		}
 		return nil, err
 	}
@@ -100,22 +98,23 @@ func NewShared(path string, buckets ...string) ([]*Client, error) {
 }
 
 func (client *Client) update(fn func(*bolt.Bucket) error) error {
-	return client.db.Update(func(tx *bolt.Tx) error {
+	return Error.Wrap(client.db.Update(func(tx *bolt.Tx) error {
 		return fn(tx.Bucket(client.Bucket))
-	})
+	}))
 }
 
 func (client *Client) view(fn func(*bolt.Bucket) error) error {
-	return client.db.View(func(tx *bolt.Tx) error {
+	return Error.Wrap(client.db.View(func(tx *bolt.Tx) error {
 		return fn(tx.Bucket(client.Bucket))
-	})
+	}))
 }
 
 // Put adds a value to the provided key in boltdb, returning an error on failure.
 func (client *Client) Put(key storage.Key, value storage.Value) error {
-	if len(key) == 0 {
-		return Error.New("invalid key")
+	if key.IsZero() {
+		return storage.ErrEmptyKey.New("")
 	}
+
 	return client.update(func(bucket *bolt.Bucket) error {
 		return bucket.Put(key, value)
 	})
@@ -123,6 +122,10 @@ func (client *Client) Put(key storage.Key, value storage.Value) error {
 
 // Get looks up the provided key from boltdb returning either an error or the result.
 func (client *Client) Get(key storage.Key) (storage.Value, error) {
+	if key.IsZero() {
+		return nil, storage.ErrEmptyKey.New("")
+	}
+
 	var value storage.Value
 	err := client.view(func(bucket *bolt.Bucket) error {
 		data := bucket.Get([]byte(key))
@@ -137,6 +140,10 @@ func (client *Client) Get(key storage.Key) (storage.Value, error) {
 
 // Delete deletes a key/value pair from boltdb, for a given the key
 func (client *Client) Delete(key storage.Key) error {
+	if key.IsZero() {
+		return storage.ErrEmptyKey.New("")
+	}
+
 	return client.update(func(bucket *bolt.Bucket) error {
 		return bucket.Delete(key)
 	})
@@ -144,19 +151,21 @@ func (client *Client) Delete(key storage.Key) error {
 
 // List returns either a list of keys for which boltdb has values or an error.
 func (client *Client) List(first storage.Key, limit int) (storage.Keys, error) {
-	return storage.ListKeys(client, first, limit)
+	rv, err := storage.ListKeys(client, first, limit)
+	return rv, Error.Wrap(err)
 }
 
 // ReverseList returns either a list of keys for which boltdb has values or an error.
 // Starts from first and iterates backwards
 func (client *Client) ReverseList(first storage.Key, limit int) (storage.Keys, error) {
-	return storage.ReverseListKeys(client, first, limit)
+	rv, err := storage.ReverseListKeys(client, first, limit)
+	return rv, Error.Wrap(err)
 }
 
 // Close closes a BoltDB client
 func (client *Client) Close() error {
 	if atomic.AddInt32(client.referenceCount, -1) == 0 {
-		return client.db.Close()
+		return Error.Wrap(client.db.Close())
 	}
 	return nil
 }
